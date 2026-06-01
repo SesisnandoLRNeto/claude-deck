@@ -1,0 +1,4 @@
+# claude-deck runtime dependencies
+# Tested with textual 8.1.1 and rich 14.3.3 on Python 3.9 (macOS).
+textual>=1.0
+rich>=13.0

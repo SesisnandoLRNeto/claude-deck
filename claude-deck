@@ -1,0 +1,1782 @@
+#!/usr/bin/env python3
+"""claude-deck — multi-account control deck for Claude Code sessions (live tasks, jump, mirror, chat, pins, resume)."""
+
+import json
+import os
+import re
+import subprocess
+import tempfile
+import time
+import sys
+import glob
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from textual.app import App, ComposeResult
+    from textual.widgets import Static, ListView, ListItem, Label, Button, Input
+    from textual.containers import Vertical, Horizontal, VerticalScroll
+    from rich.text import Text
+    from rich.markup import escape as rich_escape
+except ImportError:
+    print("Missing dependencies. Install with:\n  pip3 install textual rich")
+    sys.exit(1)
+
+def discover_config_dirs():
+    """Return [{name, color, path}] for each Claude account on disk."""
+    seen, dirs = set(), []
+
+    def add(path, name, color):
+        p = Path(path).expanduser()
+        if p.is_dir() and p not in seen:
+            seen.add(p)
+            dirs.append({"name": name, "color": color, "path": p})
+
+    add(Path.home() / ".claude",      "personal", "#89b4fa")  # blue
+    add(Path.home() / ".claude-work", "work",     "#f38ba8")  # pink/red
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env:
+        add(env, "env", "#a6e3a1")  # green
+    return dirs
+
+
+CONFIG_DIRS = discover_config_dirs()
+# Primary account (first discovered) — keeps single-account fallbacks working.
+CLAUDE_DIR = CONFIG_DIRS[0]["path"] if CONFIG_DIRS else (Path.home() / ".claude")
+
+# Pinned conversations persist across runs (session ids, account-agnostic).
+PINS_FILE = Path.home() / ".claude" / "monitor-pins.json"
+
+
+def load_pins():
+    try:
+        with open(PINS_FILE) as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_pins(pins):
+    try:
+        with open(PINS_FILE, "w") as f:
+            json.dump(sorted(pins), f)
+    except Exception:
+        pass
+
+# ── Pricing per 1M tokens ───────────────────────────────────────────────────
+
+PRICING = {
+    "claude-opus-4-5-20251101":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    "claude-opus-4-6":            {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write": 18.75},
+    "claude-sonnet-4-6":          {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_write": 3.75},
+    "claude-sonnet-4-5-20241022": {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_write": 3.75},
+    "claude-haiku-4-5-20251001":  {"input": 0.80, "output": 4.0,  "cache_read": 0.08, "cache_write": 1.0},
+}
+
+SHORT_MODEL = {
+    "claude-opus-4-5-20251101": "Opus 4.5",
+    "claude-opus-4-6": "Opus 4.6",
+    "claude-sonnet-4-6": "Sonnet 4.6",
+    "claude-sonnet-4-5-20241022": "Sonnet 4.5",
+    "claude-haiku-4-5-20251001": "Haiku 4.5",
+}
+
+# Color-coded badges for agent types (inspired by Claude Orchestra)
+AGENT_BADGE = {
+    "Explore":  ("on green",        "green"),
+    "Plan":     ("on yellow",       "yellow"),
+    "Bash":     ("on bright_green", "bright_green"),
+    "Main":     ("on cyan",         "cyan"),
+    "Review":   ("on magenta",      "magenta"),
+    "general-purpose": ("on blue",  "blue"),
+}
+
+# Tool icon colors
+TOOL_COLOR = {
+    "Read": "#a6e3a1", "Edit": "#f9e2af", "Write": "#f9e2af",
+    "Bash": "#a6e3a1", "Grep": "#89b4fa", "Glob": "#89b4fa",
+    "Agent": "#cba6f7", "Skill": "#89b4fa", "LSP": "#74c7ec",
+}
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def fmt_tokens(n):
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n/1_000:,.0f}"
+    return str(n)
+
+def fmt_cost(c):
+    return f"${c:.2f}" if c >= 1 else f"${c:.4f}"
+
+def short_model(m):
+    return SHORT_MODEL.get(m, m)
+
+def calc_cost(inp, out, cr, cw, model):
+    p = PRICING.get(model, PRICING["claude-opus-4-6"])
+    return (inp/1e6)*p["input"] + (out/1e6)*p["output"] + (cr/1e6)*p["cache_read"] + (cw/1e6)*p["cache_write"]
+
+def shorten_path(path):
+    home = str(Path.home())
+    return ("~" + path[len(home):]) if path.startswith(home) else path
+
+def build_spark(values, width=20):
+    if not values: return ""
+    blocks = " ▁▂▃▄▅▆▇█"
+    recent = values[-width:]
+    mx = max(max(recent), 0.1)
+    return "".join(blocks[min(int((v/mx)*8), 8)] for v in recent)
+
+def agent_badge(agent_type):
+    """Return a color-coded badge like [on green] Explore [/]."""
+    bg, fg = AGENT_BADGE.get(agent_type, ("on #585b70", "#cdd6f4"))
+    return f"[bold {bg}] {agent_type} [/]"
+
+def agent_color(agent_type):
+    _, fg = AGENT_BADGE.get(agent_type, ("on #585b70", "#cdd6f4"))
+    return fg
+
+
+# ── iTerm2 jump-by-TTY ────────────────────────────────────────────────────────
+
+JUMP_APPLESCRIPT = r'''
+on run argv
+    set targetTTY to item 1 of argv
+    tell application "iTerm2"
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    if (tty of s) is targetTTY then
+                        select w
+                        tell t to select
+                        tell s to select
+                        activate
+                        return "OK"
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    return "NOMATCH"
+end run
+'''
+
+
+def jump_to_tty(proc_tty):
+    """Focus the iTerm2 tab/pane whose tty matches. proc_tty is the ps column
+    like 'ttys006' (no /dev/). Returns True only on a confirmed focus."""
+    if not proc_tty or proc_tty in ("??", "?"):
+        return False
+    full = proc_tty if proc_tty.startswith("/dev/") else f"/dev/{proc_tty}"
+    try:
+        r = subprocess.run(["osascript", "-e", JUMP_APPLESCRIPT, full],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0 and r.stdout.strip() == "OK"
+    except Exception:
+        return False
+
+
+# Reads the visible screen text of a session WITHOUT activating it (no focus
+# steal). Returns the plain on-screen text for the mirror panel.
+MIRROR_APPLESCRIPT = r'''
+on run argv
+    set targetTTY to item 1 of argv
+    tell application "iTerm2"
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    if (tty of s) is targetTTY then
+                        return (text of s)
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    return ""
+end run
+'''
+
+
+def get_session_screen(proc_tty):
+    """Live screen text of the iTerm2 session on this tty, or None."""
+    if not proc_tty or proc_tty in ("??", "?"):
+        return None
+    full = proc_tty if proc_tty.startswith("/dev/") else f"/dev/{proc_tty}"
+    try:
+        r = subprocess.run(["osascript", "-e", MIRROR_APPLESCRIPT, full],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout
+    except Exception:
+        pass
+    return None
+
+
+# Sends text to a session (as if typed). `write text` appends a newline, so the
+# message is submitted — this is how the embedded input box talks to a session.
+WRITE_APPLESCRIPT = r'''
+on run argv
+    set targetTTY to item 1 of argv
+    set theText to item 2 of argv
+    tell application "iTerm2"
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    if (tty of s) is targetTTY then
+                        tell s to write text theText
+                        return "OK"
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    return "NOMATCH"
+end run
+'''
+
+
+def send_text_to_tty(proc_tty, text):
+    """Type `text` into the iTerm2 session on this tty and submit it."""
+    if not proc_tty or proc_tty in ("??", "?"):
+        return False
+    full = proc_tty if proc_tty.startswith("/dev/") else f"/dev/{proc_tty}"
+    try:
+        r = subprocess.run(["osascript", "-e", WRITE_APPLESCRIPT, full, text],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0 and r.stdout.strip() == "OK"
+    except Exception:
+        return False
+
+
+def clipboard_image_to_file():
+    """If the clipboard holds an image, write it to a temp PNG and return its
+    path (so it can be sent to a session as an image reference). Else None."""
+    fd, path = tempfile.mkstemp(prefix="cm-clip-", suffix=".png")
+    os.close(fd)
+    script = (
+        'set theFile to (open for access POSIX file "%s" with write permission)\n'
+        'try\n'
+        '    write (the clipboard as «class PNGf») to theFile\n'
+        '    close access theFile\n'
+        '    return "OK"\n'
+        'on error\n'
+        '    try\n'
+        '        close access theFile\n'
+        '    end try\n'
+        '    return "NOIMG"\n'
+        'end try\n'
+    ) % path
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=5)
+        if (r.returncode == 0 and r.stdout.strip() == "OK"
+                and os.path.exists(path) and os.path.getsize(path) > 0):
+            return path
+    except Exception:
+        pass
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return None
+
+
+# ── Data Collection ──────────────────────────────────────────────────────────
+
+def get_claude_processes():
+    try:
+        result = subprocess.run(["ps", "-eo", "pid,ppid,%cpu,%mem,etime,tty,command"],
+                                capture_output=True, text=True)
+    except Exception:
+        return []
+
+    processes = []
+    for line in result.stdout.strip().split("\n")[1:]:
+        parts = line.split()
+        if len(parts) >= 7 and parts[-1] == "claude":
+            pid = int(parts[0])
+            cpu = parts[2].replace(",", ".")
+            mem = parts[3].replace(",", ".")
+            cwd = _get_cwd(pid)
+            mcp_servers = _get_mcp_servers(pid)
+            processes.append({
+                "pid": pid, "cpu": cpu, "mem": mem,
+                "elapsed": parts[4], "tty": parts[5],
+                "cwd": cwd, "mcp_servers": mcp_servers,
+                "account": None, "session_id": "", "sess_status": "",
+            })
+    return processes
+
+
+def build_pid_index(config_dirs=CONFIG_DIRS):
+    """Map live PID -> {account, sessionId, cwd, name, status} via
+    <configdir>/sessions/<pid>.json. The account is known from which dir owns
+    the file. These files are stale-prone — use only for lookup, never liveness."""
+    idx = {}
+    for acct in config_dirs:
+        for fp in glob.glob(str(acct["path"] / "sessions" / "*.json")):
+            try:
+                with open(fp) as f:
+                    d = json.load(f)
+            except Exception:
+                continue
+            pid = d.get("pid")
+            if pid is None:
+                try:
+                    pid = int(Path(fp).stem)
+                except ValueError:
+                    continue
+            idx[pid] = {
+                "account": acct,
+                "sessionId": d.get("sessionId", ""),
+                "cwd": d.get("cwd", ""),
+                "name": d.get("name", ""),
+                "status": d.get("status", ""),
+            }
+    return idx
+
+
+def tag_processes(processes, pid_index):
+    """Attach account / sessionId / disk-status to each live process dict."""
+    for p in processes:
+        info = pid_index.get(p["pid"], {})
+        p["account"] = info.get("account")
+        p["session_id"] = info.get("sessionId", "")
+        p["sess_status"] = info.get("status", "")
+        if (not p.get("cwd") or p["cwd"] == "unknown") and info.get("cwd"):
+            p["cwd"] = info["cwd"]
+    return processes
+
+
+def _get_cwd(pid):
+    try:
+        r = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.split("\n"):
+            if line.startswith("n/"): return line[1:]
+    except Exception: pass
+    return "unknown"
+
+
+def _get_mcp_servers(pid):
+    servers = []
+    try:
+        children = subprocess.run(["pgrep", "-P", str(pid)],
+                                  capture_output=True, text=True, timeout=3).stdout.strip().split("\n")
+        for cpid_str in children:
+            if not cpid_str: continue
+            cmd = subprocess.run(["ps", "-p", cpid_str, "-o", "command="],
+                                 capture_output=True, text=True, timeout=3).stdout.strip()
+            if "mcp-atlassian" in cmd:   servers.append("Jira")
+            elif "server-github" in cmd: servers.append("GitHub")
+            elif "mcp-" in cmd:          servers.append(cmd.split("mcp-")[-1].split()[0].title())
+    except Exception: pass
+    return servers
+
+
+def get_active_sessions(n_expected, config_dirs=CONFIG_DIRS, max_age_min=120):
+    """Return [(filepath, account), ...] across all accounts, newest first."""
+    now = time.time()
+    candidates = []
+    for acct in config_dirs:
+        for fp in glob.glob(str(acct["path"] / "projects" / "*" / "*.jsonl")):
+            try:
+                age_min = (now - os.path.getmtime(fp)) / 60
+            except OSError:
+                continue
+            if age_min < max_age_min:
+                candidates.append((age_min, fp, acct))
+    candidates.sort(key=lambda c: c[0])
+    return [(fp, acct) for _, fp, acct in candidates[:max(n_expected, 5)]]
+
+
+def find_session_file(account, sid):
+    """Locate a session's jsonl under an account, ignoring the age window.
+    Used so live sessions always show even if idle for hours."""
+    hits = glob.glob(str(account["path"] / "projects" / "*" / f"{sid}.jsonl"))
+    return hits[0] if hits else None
+
+
+def fp_sid(filepath):
+    """Session id from a jsonl path."""
+    return os.path.basename(filepath).replace(".jsonl", "")
+
+
+def find_session_file_any(sid, config_dirs=CONFIG_DIRS):
+    """Find a session's file across all accounts -> (filepath, account) or None."""
+    for acct in config_dirs:
+        fp = find_session_file(acct, sid)
+        if fp:
+            return fp, acct
+    return None
+
+
+def scan_session_meta(filepath, account):
+    """Cheap title + branch for the resume list — reads only the head of the
+    file (avoids a full parse_session over hundreds of historical sessions)."""
+    sid = os.path.basename(filepath).replace(".jsonl", "")
+    title, branch = "", ""
+    try:
+        with open(filepath) as f:
+            for i, line in enumerate(f):
+                if i > 50:
+                    break
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not branch and msg.get("gitBranch"):
+                    branch = msg["gitBranch"]
+                if msg.get("type") == "summary" and msg.get("summary"):
+                    title = msg["summary"]
+                if not title and msg.get("type") == "user":
+                    txt = _msg_text(msg.get("message", {}).get("content", "")).strip()
+                    head = txt[:40]
+                    if txt and not (txt.startswith("<") and any(
+                            k in head for k in ("local-command", "system-reminder",
+                                                "ide_", "command-"))):
+                        title = txt
+    except Exception:
+        pass
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        mtime = 0
+    return {"session_id": sid, "filepath": filepath, "account": account,
+            "title": " ".join((title or sid).split()), "branch": branch, "mtime": mtime}
+
+
+def list_all_sessions(config_dirs=CONFIG_DIRS, cap=200):
+    """All conversations across every account, newest first (capped)."""
+    files = []
+    for acct in config_dirs:
+        for fp in glob.glob(str(acct["path"] / "projects" / "*" / "*.jsonl")):
+            try:
+                files.append((os.path.getmtime(fp), fp, acct))
+            except OSError:
+                continue
+    files.sort(key=lambda x: x[0], reverse=True)
+    return [scan_session_meta(fp, acct) for _, fp, acct in files[:cap]]
+
+
+def parse_session(filepath, account=None):
+    sid = os.path.basename(filepath).replace(".jsonl", "")
+    stats = {
+        "session_id": sid, "filepath": filepath,
+        "account": account,
+        "model": "unknown", "git_branch": "",
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read": 0, "cache_write": 0,
+        "messages": 0, "user_messages": 0, "tool_calls": 0,
+        "summary": "", "first_prompt": "",
+        "subagents": [], "activity": [], "tasks": [],
+        "steps": [],  # derived checklist from user msgs + Agent calls
+        "start_time": None,
+    }
+
+    try:
+        with open(filepath) as f:
+            for line in f:
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = msg.get("type")
+
+                if not stats["git_branch"] and msg.get("gitBranch"):
+                    stats["git_branch"] = msg["gitBranch"]
+                if not stats["start_time"] and msg.get("timestamp"):
+                    stats["start_time"] = msg["timestamp"]
+
+                if t == "assistant":
+                    stats["messages"] += 1
+                    m = msg.get("message", {})
+                    model = m.get("model", "")
+                    if model: stats["model"] = model
+                    u = m.get("usage", {})
+                    stats["input_tokens"] += u.get("input_tokens", 0)
+                    stats["output_tokens"] += u.get("output_tokens", 0)
+                    stats["cache_read"] += u.get("cache_read_input_tokens", 0)
+                    stats["cache_write"] += u.get("cache_creation_input_tokens", 0)
+
+                    ts = msg.get("timestamp", "")
+                    is_side = msg.get("isSidechain", False)
+
+                    for block in m.get("content", []):
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            stats["tool_calls"] += 1
+                            tool_name = block.get("name", "")
+                            inp = block.get("input", {})
+                            detail = ""
+                            if "command" in inp:
+                                detail = inp["command"].split("\n")[0][:50]
+                            elif "file_path" in inp:
+                                detail = shorten_path(inp["file_path"])
+                            elif "pattern" in inp:
+                                p = inp["pattern"]
+                                path = inp.get("path", "")
+                                detail = f'"{p}"' + (f" in {shorten_path(path)}" if path else "")
+                                detail = detail[:50]
+                            elif "prompt" in inp:
+                                detail = inp.get("description", inp["prompt"][:40])
+                            elif "skill" in inp:
+                                detail = inp["skill"]
+
+                            agent_label = "Main" if not is_side else "Agent"
+                            time_str = ts.split("T")[1][:8] if "T" in ts else ""
+                            stats["activity"].append({
+                                "time": time_str, "agent": agent_label,
+                                "tool": tool_name, "detail": detail[:60],
+                                "is_side": is_side,
+                            })
+
+                            # Capture Agent tool calls as steps
+                            if tool_name == "Agent" and not is_side:
+                                desc = inp.get("description", "")
+                                if desc:
+                                    stats["steps"].append({
+                                        "text": desc[:55],
+                                        "status": "completed",
+                                    })
+
+                elif t == "user":
+                    stats["user_messages"] += 1
+                    if not stats["first_prompt"]:
+                        content = msg.get("message", {}).get("content", "")
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    content = c["text"]
+                                    break
+                        text = str(content).strip()
+                        if text.startswith("<local-command") or text.startswith("<ide_") or text.startswith("<command"):
+                            real = re.split(r'</[^>]+>', text)
+                            for chunk in real:
+                                chunk = chunk.strip()
+                                if chunk and not chunk.startswith("<"):
+                                    stats["first_prompt"] = chunk[:80]
+                                    break
+                        else:
+                            stats["first_prompt"] = text[:80]
+
+                    # Capture real user messages as conversation steps
+                    if stats["first_prompt"] and stats["user_messages"] > 0:
+                        content = msg.get("message", {}).get("content", "")
+                        if isinstance(content, str) and not content.startswith("<") and not content.startswith("[{"):
+                            step_text = content.strip()[:55]
+                            if step_text and len(step_text) > 5:
+                                stats["steps"].append({
+                                    "text": step_text,
+                                    "status": "completed",
+                                })
+
+                elif t == "summary":
+                    stats["summary"] = msg.get("summary", "")
+
+    except Exception:
+        pass
+
+    # ── Subagents ────────────────────────────────────────────────────────
+    subdir = Path(filepath).parent / sid / "subagents"
+    if subdir.is_dir():
+        for meta_file in subdir.glob("*.meta.json"):
+            try:
+                with open(meta_file) as mf:
+                    meta = json.load(mf)
+                agent_id = meta_file.stem.replace(".meta", "")
+                agent_type = meta.get("agentType", "?")
+                jsonl_file = subdir / f"{agent_id}.jsonl"
+                sa = {"id": agent_id[:16], "type": agent_type,
+                      "model": "", "tokens_in": 0, "tokens_out": 0,
+                      "messages": 0, "task": "", "tool_calls": 0,
+                      "status": "done", "tools_used": []}
+
+                if jsonl_file.exists():
+                    file_age = (time.time() - os.path.getmtime(str(jsonl_file))) / 60
+                    if file_age < 2:
+                        sa["status"] = "active"
+
+                    with open(jsonl_file) as af:
+                        for aline in af:
+                            try:
+                                amsg = json.loads(aline)
+                                if amsg.get("type") == "user" and not sa["task"]:
+                                    content = amsg.get("message", {}).get("content", "")
+                                    if isinstance(content, list):
+                                        for c in content:
+                                            if isinstance(c, dict) and c.get("type") == "text":
+                                                content = c["text"]
+                                                break
+                                    task = str(content).strip()
+                                    if task.startswith("Your task is to create a detailed summary"):
+                                        sa["task"] = "Context compression / summarization"
+                                    else:
+                                        sa["task"] = task[:100]
+                                elif amsg.get("type") == "assistant":
+                                    sa["messages"] += 1
+                                    am = amsg.get("message", {})
+                                    if am.get("model"): sa["model"] = am["model"]
+                                    au = am.get("usage", {})
+                                    sa["tokens_in"] += au.get("input_tokens", 0) + au.get("cache_read_input_tokens", 0)
+                                    sa["tokens_out"] += au.get("output_tokens", 0)
+                                    for block in am.get("content", []):
+                                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                                            sa["tool_calls"] += 1
+                                            tn = block.get("name", "")
+                                            if tn and tn not in sa["tools_used"]:
+                                                sa["tools_used"].append(tn)
+                                            inp = block.get("input", {})
+                                            detail = ""
+                                            if "file_path" in inp: detail = shorten_path(inp["file_path"])
+                                            elif "pattern" in inp: detail = f'"{inp["pattern"]}"'[:30]
+                                            elif "command" in inp: detail = inp["command"].split("\n")[0][:40]
+                                            ts_a = amsg.get("timestamp", "")
+                                            time_str = ts_a.split("T")[1][:8] if "T" in ts_a else ""
+                                            stats["activity"].append({
+                                                "time": time_str, "agent": agent_type[:7],
+                                                "tool": tn, "detail": detail[:55],
+                                                "is_side": True,
+                                            })
+                            except json.JSONDecodeError:
+                                continue
+                stats["subagents"].append(sa)
+            except Exception:
+                continue
+
+    # ── Tasks ────────────────────────────────────────────────────────────
+    acct_dir = account["path"] if account else CLAUDE_DIR
+    tasks_dir = acct_dir / "tasks" / sid
+    if tasks_dir.is_dir():
+        for tf in sorted(tasks_dir.glob("*.json"), key=lambda f: int(f.stem) if f.stem.isdigit() else 0):
+            try:
+                with open(tf) as fh:
+                    task = json.load(fh)
+                stats["tasks"].append({
+                    "id": task.get("id", ""),
+                    "subject": task.get("subject", ""),
+                    "status": task.get("status", "pending"),
+                    "active_form": task.get("activeForm", ""),
+                    "blocked_by": task.get("blockedBy", []),
+                    "blocks": task.get("blocks", []),
+                })
+            except Exception:
+                continue
+
+    stats["activity"].sort(key=lambda a: a["time"])
+    return stats
+
+
+def get_global_stats(config_dirs=CONFIG_DIRS):
+    """Merge stats-cache.json across all accounts (sum modelUsage key-by-key)."""
+    merged = {}
+    found = False
+    for acct in config_dirs:
+        sf = acct["path"] / "stats-cache.json"
+        if not sf.exists():
+            continue
+        try:
+            with open(sf) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        found = True
+        for model, usage in data.get("modelUsage", {}).items():
+            agg = merged.setdefault(model, {})
+            for k, v in usage.items():
+                if isinstance(v, (int, float)):
+                    agg[k] = agg.get(k, 0) + v
+    return {"modelUsage": merged} if found else None
+
+
+# ── Recent Tasks (cross-account) ──────────────────────────────────────────────
+
+def session_label(sid, session, name_by_sid):
+    """A clean, human name for a session: its Claude session name (e.g.
+    'fusion-753', 'padmdrac-2') when known, else git branch, else cwd, else id."""
+    name = (name_by_sid or {}).get(sid)
+    if name:
+        return name
+    branch = (session or {}).get("git_branch", "")
+    if branch and branch != "HEAD":
+        return branch
+    cwd = ((session or {}).get("_proc") or {}).get("cwd", "")
+    if cwd:
+        return os.path.basename(cwd.rstrip("/")) or shorten_path(cwd)
+    return sid[:8]
+
+
+def build_recent_rows(sessions, pins=frozenset(), name_by_sid=None):
+    """Flatten parsed sessions into render-ready rows. Pinned first, then newest.
+    `sessions` already carry `_proc` (live process or None) and `account`."""
+    rows = []
+    for s in sessions:
+        proc = s.get("_proc")
+        live = proc is not None
+        acct = s.get("account") or {"name": "?", "color": "#585b70"}
+        try:
+            mtime = os.path.getmtime(s["filepath"])
+        except OSError:
+            mtime = 0
+
+        if live:
+            status = proc.get("sess_status") or "idle"
+        else:
+            status = "ended"
+
+        label = " ".join(session_label(s["session_id"], s, name_by_sid).split())[:48]
+        summary = (s["summary"] or s["first_prompt"] or "—")
+        # Collapse whitespace so a one-line row never wraps or grows in height.
+        summary = " ".join(summary.split())[:48]
+        cost = calc_cost(s["input_tokens"], s["output_tokens"],
+                         s["cache_read"], s["cache_write"], s["model"])
+
+        rows.append({
+            "key": s["session_id"],
+            "mtime": mtime,
+            "account": acct,
+            "live": live,
+            "tty": (proc or {}).get("tty", ""),
+            "status": status,
+            "label": label or "~",
+            "summary": summary,
+            "cost": cost,
+            "tokens": s["input_tokens"] + s["cache_read"],
+            "pinned": s["session_id"] in pins,
+        })
+    # Pinned first, then most recent.
+    rows.sort(key=lambda r: (not r["pinned"], -r["mtime"]))
+    return rows
+
+
+def build_resume_rows(metas, live_by_sid, pins=frozenset(), name_by_sid=None):
+    """Render-ready rows for the resume (all conversations) list. `live_by_sid`
+    maps a session id to its live process dict, if any."""
+    name_by_sid = name_by_sid or {}
+    rows = []
+    for m in metas:
+        sid = m["session_id"]
+        proc = live_by_sid.get(sid)
+        live = proc is not None
+        acct = m["account"] or {"name": "?", "color": "#585b70"}
+        status = (proc.get("sess_status") or "idle") if live else "ended"
+        name = name_by_sid.get(sid) or m.get("name") or ""
+        if not name:
+            br = m["branch"] or ""
+            name = br if br and br != "HEAD" else ""
+        label = " ".join(name.split())[:48] or "~"
+        rows.append({
+            "key": sid,
+            "mtime": m["mtime"],
+            "account": acct,
+            "live": live,
+            "tty": (proc or {}).get("tty", ""),
+            "status": status,
+            "label": label,
+            "summary": m["title"][:48] or "—",
+            "cost": 0.0,
+            "tokens": 0,
+            "pinned": sid in pins,
+        })
+    rows.sort(key=lambda r: (not r["pinned"], -r["mtime"]))
+    return rows
+
+
+def recent_row_markup(r, n):
+    """One row for the Recent / Resume list. Ended rows are dimmed."""
+    acct = r["account"]
+    pin = "[yellow]★[/]" if r.get("pinned") else " "
+
+    if r["status"] == "busy":   dot = "[bright_green]●[/]"
+    elif r["status"] == "idle": dot = "[yellow]◐[/]"
+    else:                       dot = "[#585b70]○[/]"
+
+    label = rich_escape(r["label"][:20])
+    summary = rich_escape(r["summary"][:30])
+    # Metrics only when we have them (resume rows carry 0/0 — show blanks).
+    metrics = ""
+    if r["tokens"] or r["cost"]:
+        metrics = (f"[dim]{fmt_tokens(r['tokens']):>6}[/] "
+                   f"[red]{fmt_cost(r['cost']):>7}[/]")
+    if r["live"]:
+        badge = f"[bold on {acct['color']}] {acct['name'][:4]:<4} [/]"
+        return (f"{pin}[dim]{n:>2}[/] {dot} {badge} "
+                f"[#89b4fa]{label:<20}[/] "
+                f"{summary:<30} {metrics} [green]↵[/]")
+    return (f"{pin}[dim]{n:>2}[/] {dot} [dim on {acct['color']}] {acct['name'][:4]:<4} [/] "
+            f"[dim #6c7086]{label:<20}[/] "
+            f"[dim #6c7086]{summary:<30}[/] {metrics}  ")
+
+
+def _msg_text(content):
+    """Pull plain text out of a message content (str or list of blocks)."""
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                return c.get("text", "")
+        return ""
+    return str(content or "")
+
+
+def _tool_detail(inp):
+    if "command" in inp:   return inp["command"].split("\n")[0][:60]
+    if "file_path" in inp: return shorten_path(inp["file_path"])
+    if "pattern" in inp:   return f'"{inp["pattern"]}"'[:50]
+    if "description" in inp: return inp["description"][:60]
+    if "skill" in inp:     return inp["skill"]
+    return ""
+
+
+def build_transcript(filepath, tail=80):
+    """Reconstruct a readable conversation from a session jsonl: ordered
+    (role, text) entries for user prompts, assistant text, and tool calls."""
+    entries = []
+    try:
+        with open(filepath) as f:
+            for line in f:
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = msg.get("type")
+                if t == "user":
+                    text = _msg_text(msg.get("message", {}).get("content", "")).strip()
+                    if not text:
+                        continue
+                    head = text[:40]
+                    if text.startswith("<") and any(k in head for k in
+                            ("local-command", "system-reminder", "ide_", "command-")):
+                        continue
+                    entries.append(("user", text))
+                elif t == "assistant":
+                    for block in msg.get("message", {}).get("content", []):
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "text":
+                            txt = block.get("text", "").strip()
+                            if txt:
+                                entries.append(("assistant", txt))
+                        elif block.get("type") == "tool_use":
+                            name = block.get("name", "")
+                            detail = _tool_detail(block.get("input", {}))
+                            entries.append(("tool", f"{name}  {detail}".strip()))
+    except Exception:
+        pass
+    return entries[-tail:]
+
+
+class TaskRow(ListItem):
+    """A row in the conversations list. Either a real chat (carries tty + session
+    id) or a non-selectable section header (is_header=True)."""
+
+    def __init__(self, *, tty, live, markup, row_key, is_header=False):
+        super().__init__(Label(Text.from_markup(markup)))
+        self.tty = tty
+        self.live = live
+        self.row_key = row_key
+        self.is_header = is_header
+        if is_header:
+            self.disabled = True   # headers can't be highlighted or clicked
+
+
+# ── TUI ──────────────────────────────────────────────────────────────────────
+
+class ClaudeMonitor(App):
+    TITLE = "Claude Deck"
+
+    CSS = """
+    Screen { background: #1e1e2e; }
+
+    #header-bar {
+        dock: top; height: 1;
+        background: #313244; color: #89b4fa;
+        padding: 0 1; text-style: bold;
+    }
+
+    #top-row {
+        height: 1fr; min-height: 10;
+        margin: 0 1;
+    }
+    #recent-panel {
+        width: 54; min-width: 46;
+        border: solid #585b70;
+        border-title-color: #cdd6f4;
+        border-title-style: bold;
+        background: #1e1e2e;
+    }
+    #recent-tasks {
+        background: #1e1e2e;
+        height: 1fr;
+        scrollbar-size-vertical: 1;
+    }
+    #recent-tasks > TaskRow {
+        background: #1e1e2e;
+        height: 1;
+    }
+    #recent-tasks > TaskRow.-highlight {
+        background: #45475a;
+    }
+    #recent-tasks:focus > TaskRow.-highlight {
+        background: #585b70;
+    }
+    #agent-tree-panel {
+        width: 1fr;
+        border: solid #585b70;
+        border-title-color: #cdd6f4;
+        border-title-style: bold;
+        padding: 0 1;
+        background: #1e1e2e;
+    }
+    #tasks-panel {
+        width: 1fr;
+        border: solid #585b70;
+        border-title-color: #cdd6f4;
+        border-title-style: bold;
+        padding: 0 1;
+        background: #1e1e2e;
+    }
+    #stats-panel {
+        width: 38; min-width: 36;
+        border: solid #585b70;
+        border-title-color: #cdd6f4;
+        border-title-style: bold;
+        padding: 0 1;
+        background: #1e1e2e;
+    }
+
+    #focus-panel {
+        width: 1fr;
+        border: solid #89b4fa;
+        border-title-color: #89b4fa;
+        border-title-style: bold;
+        background: #1e1e2e;
+        display: none;
+    }
+    #focus-toolbar {
+        height: 3;
+        background: #181825;
+    }
+    #focus-toolbar Button {
+        margin: 0 1;
+        min-width: 14;
+        height: 3;
+    }
+    #focus-title {
+        width: 1fr;
+        height: 3;
+        content-align: left middle;
+        color: #cdd6f4;
+        padding: 0 1;
+    }
+    #focus-scroll {
+        height: 1fr;
+        padding: 0 1;
+        background: #1e1e2e;
+    }
+    #focus-input {
+        dock: bottom;
+        height: 3;
+        background: #181825;
+        border: tall #45475a;
+    }
+    #focus-input:focus {
+        border: tall #89b4fa;
+    }
+
+    #bottom-row {
+        height: auto; max-height: 10; min-height: 7;
+        margin: 0 1;
+        border: solid #585b70;
+        border-title-color: #cdd6f4;
+        border-title-style: bold;
+        background: #1e1e2e;
+    }
+
+    #command-bar {
+        dock: bottom; height: 1;
+        background: #313244; color: #bac2de;
+        padding: 0 1;
+    }
+    #footer-bar {
+        dock: bottom; height: 1;
+        background: #f9e2af; color: #1e1e2e;
+        padding: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("r", "refresh", "Refresh"),
+        ("j", "jump_current", "Jump"),
+        ("p", "toggle_pin", "Pin"),
+        ("R", "toggle_resume", "Resume list"),
+        ("m", "toggle_view", "Mirror/Transcript"),
+        ("i", "attach_image", "Attach image"),
+        ("escape", "back", "Back"),
+        ("l", "cycle_log", "Log"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.cpu_history = []
+        self.all_sessions = []
+        self.all_processes = []
+        self.selected_idx = 0
+        self.log_lines = 10
+        self.focus_sid = None          # session id being viewed in the focus pane
+        self.focus_view = "mirror"     # "mirror" | "transcript"
+        self.pins = load_pins()        # pinned session ids (persisted)
+        self.resume_mode = False       # list shows ALL conversations when True
+        self.resume_metas = []         # cached scan of all sessions (resume mode)
+        self.sid_files = {}            # sid -> (filepath, account) for any listed session
+        self.name_by_sid = {}          # sid -> clean session name (e.g. 'fusion-753')
+        self._last_click_sid = None    # for single- vs double-click detection
+        self._last_click_time = 0.0
+
+    def compose(self) -> ComposeResult:
+        yield Static("⬡  CLAUDE DECK | MULTI-ACCOUNT CONTROL", id="header-bar")
+
+        tree_panel = VerticalScroll(Static("", id="agent-tree"), id="agent-tree-panel")
+        tree_panel.border_title = "Agent Tree"
+
+        tasks_panel = VerticalScroll(Static("", id="tasks-content"), id="tasks-panel")
+        tasks_panel.border_title = "Tasks"
+
+        stats_panel = Vertical(Static("", id="stats-content"), id="stats-panel")
+        stats_panel.border_title = "Session Stats"
+
+        recent_panel = Vertical(ListView(id="recent-tasks"), id="recent-panel")
+        recent_panel.border_title = "Conversations"
+
+        focus_panel = Vertical(
+            Horizontal(
+                Button("← Back", id="focus-back", variant="primary"),
+                Button("View: Mirror", id="focus-toggle"),
+                Button("Attach Img", id="focus-attach", variant="success"),
+                Static("", id="focus-title"),
+                id="focus-toolbar",
+            ),
+            VerticalScroll(Static("", id="focus-content"), id="focus-scroll"),
+            Input(placeholder="Type a message and press Enter to send to this session…",
+                  id="focus-input"),
+            id="focus-panel",
+        )
+        focus_panel.border_title = "Conversation"
+
+        yield Horizontal(recent_panel, tree_panel, tasks_panel, stats_panel,
+                         focus_panel, id="top-row")
+
+        activity_panel = VerticalScroll(Static("", id="activity-content"), id="bottom-row")
+        activity_panel.border_title = "Activity"
+
+        yield activity_panel
+        yield Static("", id="footer-bar")
+        yield Static("", id="command-bar")
+
+    def on_mount(self) -> None:
+        self._render_command_bar()
+        self.refresh_data()
+        self.set_interval(3, self.refresh_data)
+
+    def action_cycle_log(self) -> None:
+        self.log_lines = 20 if self.log_lines == 10 else 10
+        self._render_selected()
+
+    def _render_command_bar(self):
+        self.query_one("#command-bar", Static).update(
+            "[b]click[/]:Panels  [b]2×click[/]:Chat  [b]m[/]:Mirror/Transcript  "
+            "[b]i[/]:Img  [b]esc[/]:Back  [b]j[/]:Jump  [b]p[/]:Pin  "
+            "[b]R[/]:Resume-all  [b]q[/]:Quit  │  ↻ 3s"
+        )
+
+    def refresh_data(self) -> None:
+        self.all_processes = get_claude_processes()
+        pid_index = build_pid_index()
+        tag_processes(self.all_processes, pid_index)
+
+        session_pairs = get_active_sessions(len(self.all_processes))
+        seen_sids = {os.path.basename(fp).replace(".jsonl", "") for fp, _ in session_pairs}
+
+        # Always include every live session, even if its file is older than the
+        # age window — those are the tabs the user most wants to jump to.
+        for p in self.all_processes:
+            sid = p.get("session_id")
+            acct = p.get("account")
+            if sid and acct and sid not in seen_sids:
+                fp = find_session_file(acct, sid)
+                if fp:
+                    session_pairs.append((fp, acct))
+                    seen_sids.add(sid)
+
+        # Always include pinned sessions too, so they show on startup even if old.
+        for sid in self.pins:
+            if sid not in seen_sids:
+                hit = find_session_file_any(sid)
+                if hit:
+                    session_pairs.append(hit)
+                    seen_sids.add(sid)
+
+        self.all_sessions = [parse_session(fp, acct) for fp, acct in session_pairs]
+
+        # Real join on sessionId — liveness comes from a running process, never
+        # from the stale sessions/<pid>.json files.
+        proc_by_sid = {p["session_id"]: p
+                       for p in self.all_processes if p.get("session_id")}
+        for s in self.all_sessions:
+            s["_proc"] = proc_by_sid.get(s["session_id"])
+            s["_live"] = s["_proc"] is not None
+
+        if self.selected_idx >= len(self.all_sessions):
+            self.selected_idx = 0
+
+        # sid -> (filepath, account) so the focus view can open any listed session.
+        self.sid_files = {fp_sid(fp): (fp, acct) for fp, acct in session_pairs}
+
+        # sid -> clean session name (e.g. 'fusion-753'), from the sessions/*.json.
+        self.name_by_sid = {info["sessionId"]: info["name"]
+                            for info in pid_index.values()
+                            if info.get("sessionId") and info.get("name")}
+
+        self._render_list()
+        self._render_selected()
+        if self.focus_sid:
+            self._render_focus()
+
+    def _render_list(self):
+        """Render either the recent rows or the resume (all) rows into the list,
+        with pinned conversations grouped into their own section at the top."""
+        if self.resume_mode:
+            live_by_sid = {p["session_id"]: p
+                           for p in self.all_processes if p.get("session_id")}
+            rows = build_resume_rows(self.resume_metas, live_by_sid, self.pins,
+                                     self.name_by_sid)
+            for m in self.resume_metas:
+                self.sid_files.setdefault(m["session_id"], (m["filepath"], m["account"]))
+        else:
+            rows = build_recent_rows(self.all_sessions, self.pins, self.name_by_sid)
+
+        pinned = [r for r in rows if r.get("pinned")]
+        others = [r for r in rows if not r.get("pinned")]
+
+        display = []
+        n = 0
+
+        def add_chat(r):
+            nonlocal n
+            n += 1
+            display.append({"key": r["key"], "live": r["live"], "tty": r["tty"],
+                            "header": False, "markup": recent_row_markup(r, n)})
+
+        def add_header(key, text):
+            display.append({"key": key, "live": False, "tty": "",
+                            "header": True, "markup": text})
+
+        # Pinned chats first (each marked with ★), then a divider, then the rest.
+        # No header above the first row, so the cursor always lands on a real chat.
+        for r in pinned:
+            add_chat(r)
+        if pinned and others:
+            add_header("__hdr_div__", "[dim]──────  pinned ↑  ·  others ↓  ──────[/]")
+        for r in others:
+            add_chat(r)
+
+        self._render_recent_tasks(display)
+
+    # ── Recent Tasks ─────────────────────────────────────────────────────
+
+    def _render_recent_tasks(self, rows):
+        """Diff, don't rebuild — a full clear() every 3s would wipe the cursor
+        and focus. Fast path updates labels in place when the row set is same."""
+        lv = self.query_one("#recent-tasks", ListView)
+        existing_keys = [c.row_key for c in lv.children if isinstance(c, TaskRow)]
+        desired_keys = [r["key"] for r in rows]
+
+        if existing_keys == desired_keys:
+            for c, r in zip(lv.children, rows):
+                c.query_one(Label).update(Text.from_markup(r["markup"]))
+                c.live, c.tty = r["live"], r["tty"]
+            return
+
+        saved = lv.index
+        lv.clear()
+        for r in rows:
+            lv.append(TaskRow(tty=r["tty"], live=r["live"], markup=r["markup"],
+                              row_key=r["key"], is_header=r.get("header", False)))
+        if saved is not None and saved < len(rows):
+            lv.index = saved
+
+    def _jump_row(self, item) -> None:
+        if not isinstance(item, TaskRow):
+            return
+        if item.live and item.tty:
+            if not jump_to_tty(item.tty):
+                self.notify("Session not found in iTerm2 (ended or other terminal)",
+                            severity="warning", timeout=3)
+        else:
+            self.notify("Session ended — nothing to jump to",
+                        severity="information", timeout=2)
+
+    def on_list_view_selected(self, event) -> None:
+        # Single click / Enter -> show that session's dashboard panels.
+        # Double click / double Enter -> open the embedded conversation (chat).
+        if not isinstance(event.item, TaskRow) or event.item.is_header:
+            return
+        sid = event.item.row_key
+        now = time.time()
+        double = (sid == self._last_click_sid and now - self._last_click_time < 0.45)
+        self._last_click_sid = sid
+        self._last_click_time = now
+        if double:
+            self._enter_focus(sid)
+        else:
+            if self.focus_sid:
+                self._exit_focus()
+            self._show_session_panels(sid, allow_focus=True)
+
+    def on_list_view_highlighted(self, event) -> None:
+        # Arrow-key navigation updates the dashboard panels (but never opens chat).
+        if self.focus_sid:
+            return
+        if isinstance(event.item, TaskRow) and not event.item.is_header:
+            self._show_session_panels(event.item.row_key, allow_focus=False)
+
+    def _show_session_panels(self, sid, allow_focus=False) -> None:
+        """Point the Agent Tree / Tasks / Stats panels at this session."""
+        idx = next((i for i, s in enumerate(self.all_sessions)
+                    if s["session_id"] == sid), None)
+        if idx is None:
+            # Historical (resume) row with no live dashboard data. A click opens
+            # its transcript; an arrow-highlight does nothing.
+            if allow_focus:
+                self._enter_focus(sid)
+            return
+        self.selected_idx = idx
+        self._render_selected()
+
+    def action_jump_current(self) -> None:
+        # `j` jumps to the real iTerm2 tab instead of opening the embedded view.
+        item = self._highlighted_row()
+        if item:
+            self._jump_row(item)
+
+    def _highlighted_row(self):
+        lv = self.query_one("#recent-tasks", ListView)
+        if lv.index is not None and 0 <= lv.index < len(lv.children):
+            item = lv.children[lv.index]
+            if isinstance(item, TaskRow) and not item.is_header:
+                return item
+        return None
+
+    # ── Focus (embedded conversation) ────────────────────────────────────
+
+    _DASHBOARD_PANELS = ("#agent-tree-panel", "#tasks-panel", "#stats-panel")
+
+    def _enter_focus(self, sid) -> None:
+        if not sid:
+            return
+        self.focus_sid = sid
+        # Open on the colorful transcript by default; the live mirror is one
+        # keypress away (m). Sending input flips to mirror to show the result.
+        self.focus_view = "transcript"
+        for pid in self._DASHBOARD_PANELS:
+            self.query_one(pid).display = False
+        self.query_one("#focus-panel").display = True
+        self._render_focus()
+
+    def _exit_focus(self) -> None:
+        self.focus_sid = None
+        self.query_one("#focus-panel").display = False
+        for pid in self._DASHBOARD_PANELS:
+            self.query_one(pid).display = True
+
+    def action_back(self) -> None:
+        if self.focus_sid:
+            self._exit_focus()
+
+    def action_toggle_view(self) -> None:
+        if not self.focus_sid:
+            return
+        self.focus_view = "transcript" if self.focus_view == "mirror" else "mirror"
+        self._render_focus()
+
+    def on_button_pressed(self, event) -> None:
+        if event.button.id == "focus-back":
+            self._exit_focus()
+        elif event.button.id == "focus-toggle":
+            self.action_toggle_view()
+        elif event.button.id == "focus-attach":
+            self.action_attach_image()
+
+    def _live_focus_tty(self):
+        """tty of the focused session if it is live, else None (with a toast)."""
+        if not self.focus_sid:
+            self.notify("Open a conversation first", severity="warning", timeout=2)
+            return None
+        s = next((x for x in self.all_sessions
+                  if x["session_id"] == self.focus_sid), None)
+        proc = (s or {}).get("_proc") or {}
+        if s and s.get("_live") and proc.get("tty"):
+            return proc["tty"]
+        self.notify("This session is not live — cannot send", severity="warning", timeout=3)
+        return None
+
+    def action_attach_image(self) -> None:
+        tty = self._live_focus_tty()
+        if not tty:
+            return
+        img = clipboard_image_to_file()
+        if not img:
+            self.notify("No image in the clipboard (copy a screenshot first)",
+                        severity="warning", timeout=3)
+            return
+        inp = self.query_one("#focus-input", Input)
+        text = inp.value.strip()
+        # Claude reads a local image path referenced in the message; pair it with
+        # any text already typed in the box.
+        msg = f"{text} {img}".strip() if text else img
+        if send_text_to_tty(tty, msg):
+            inp.value = ""
+            self.focus_view = "mirror"
+            self.set_timer(0.6, self._render_focus)
+            self.notify("Image sent", timeout=1)
+        else:
+            self.notify("Could not send the image", severity="warning", timeout=3)
+
+    # ── Pins & Resume list ───────────────────────────────────────────────
+
+    def action_toggle_pin(self) -> None:
+        item = self._highlighted_row()
+        if not item:
+            return
+        sid = item.row_key
+        if sid in self.pins:
+            self.pins.discard(sid)
+            self.notify("Unpinned", timeout=1)
+        else:
+            self.pins.add(sid)
+            self.notify("Pinned", timeout=1)
+        save_pins(self.pins)
+        self._render_list()
+
+    def action_toggle_resume(self) -> None:
+        self.resume_mode = not self.resume_mode
+        panel = self.query_one("#recent-panel")
+        if self.resume_mode:
+            self.resume_metas = list_all_sessions()
+            panel.border_title = f"Conversations · all ({len(self.resume_metas)})"
+        else:
+            self.resume_metas = []
+            panel.border_title = "Conversations"
+        self._render_list()
+
+    # ── Send input to a live session ─────────────────────────────────────
+
+    def on_input_submitted(self, event) -> None:
+        if event.input.id != "focus-input":
+            return
+        text = event.value
+        if not text.strip():
+            return
+        tty = self._live_focus_tty()
+        if not tty:
+            return
+        if send_text_to_tty(tty, text):
+            event.input.value = ""
+            self.focus_view = "mirror"      # show the result land in the terminal
+            self.set_timer(0.5, self._render_focus)
+        else:
+            self.notify("Could not send to the iTerm2 session",
+                        severity="warning", timeout=3)
+
+    def _md(self, text):
+        """Light markdown -> rich markup, with escaping done first so brackets in
+        the text never break rendering. Handles **bold**, `code`, # headers, bullets."""
+        t = rich_escape(text)
+        t = re.sub(r"\*\*(.+?)\*\*", r"[b]\1[/b]", t)
+        t = re.sub(r"`([^`]+)`", r"[#a6e3a1]\1[/]", t)
+        lines = []
+        for ln in t.split("\n"):
+            s = ln.lstrip()
+            if s.startswith("### "):
+                ln = f"[bold #74c7ec]{s[4:]}[/]"
+            elif s.startswith("## "):
+                ln = f"[bold #89b4fa]{s[3:]}[/]"
+            elif s.startswith("# "):
+                ln = f"[bold #cba6f7]{s[2:]}[/]"
+            elif s[:2] in ("- ", "* "):
+                indent = ln[:len(ln) - len(s)]
+                ln = f"{indent}[#f9e2af]•[/] {s[2:]}"
+            lines.append(ln)
+        return "\n".join(lines)
+
+    def _format_transcript(self, entries):
+        out = []
+        for role, text in entries:
+            if role == "tool":
+                name = text.split()[0] if text else "tool"
+                detail = text[len(name):].strip()
+                tc = TOOL_COLOR.get(name, "#cba6f7")
+                out.append(f"  [{tc}]⚙ {rich_escape(name)}[/] "
+                           f"[dim]{rich_escape(' '.join(detail.split())[:80])}[/]")
+            elif role == "user":
+                out.append("")
+                out.append("[#1e1e2e on #89dceb] ❯ you [/]")
+                out.append(self._md(text[:1500]))
+            else:
+                out.append("")
+                out.append("[#1e1e2e on #a6e3a1] ✦ assistant [/]")
+                out.append(self._md(text[:1500]))
+        return "\n".join(out) if out else "[dim]No transcript yet.[/]"
+
+    def _render_focus(self) -> None:
+        if not self.focus_sid:
+            return
+        content = self.query_one("#focus-content", Static)
+        title = self.query_one("#focus-title", Static)
+        toggle = self.query_one("#focus-toggle", Button)
+        toggle.label = "View: Transcript" if self.focus_view == "mirror" else "View: Mirror"
+
+        sid = self.focus_sid
+        s = next((x for x in self.all_sessions if x["session_id"] == sid), None)
+        name = self.name_by_sid.get(sid, "")
+        if s is not None:
+            acct = s.get("account") or {}
+            proc = s.get("_proc") or {}
+            live = bool(s.get("_live"))
+            filepath = s["filepath"]
+            summary = s["summary"] or s["first_prompt"] or sid
+        else:
+            # Historical session chosen from the resume list — resolve its file.
+            ref = self.sid_files.get(sid)
+            if not ref:
+                title.update("[dim]session not found[/]")
+                content.update("[dim]Could not locate this conversation's file.[/]")
+                return
+            filepath, acct = ref
+            proc, live = {}, False
+            summary = scan_session_meta(filepath, acct)["title"]
+
+        # Lead with the clean session name, then the summary.
+        name_part = f"[b]{rich_escape(name)}[/]  " if name else ""
+        label = name_part + rich_escape(" ".join(str(summary).split())[:48])
+        live_tag = "[green]● live[/]" if live else "[#585b70]○ ended[/]"
+        pin_tag = " [yellow]★ pinned[/]" if sid in self.pins else ""
+        title.update(
+            f"[bold {acct.get('color', '#cdd6f4')}]{acct.get('name', '?')}[/]  "
+            f"{label}  {live_tag}{pin_tag}   [dim](m: toggle · esc: back)[/]"
+        )
+
+        if self.focus_view == "mirror":
+            if live and proc.get("tty"):
+                screen = get_session_screen(proc["tty"])
+                if screen is None:
+                    content.update("[yellow]Could not read the screen from iTerm2.[/]\n"
+                                   "Press [b]m[/] for the transcript instead.")
+                else:
+                    content.update(Text(screen.rstrip("\n")))   # literal, no markup
+            else:
+                content.update("[dim]Not live — no terminal to mirror.[/]\n"
+                               "Press [b]m[/] for the transcript.")
+        else:
+            entries = build_transcript(filepath)
+            content.update(Text.from_markup(self._format_transcript(entries)))
+
+    def _render_selected(self):
+        if not self.all_sessions:
+            return
+        s = self.all_sessions[self.selected_idx]
+        proc = s.get("_proc") or {}
+        self._render_agent_tree(s, proc)
+        self._render_tasks(s)
+        self._render_stats(s, proc)
+        self._render_activity(s)
+        self._render_footer(s, proc)
+
+    # ── Agent Tree ───────────────────────────────────────────────────────
+
+    def _render_agent_tree(self, s, proc):
+        widget = self.query_one("#agent-tree", Static)
+        lines = []
+
+        cpu = proc.get("cpu", "0")
+        elapsed = proc.get("elapsed", "—")
+        try:
+            cpu_f = float(cpu)
+            if cpu_f > 20:   dot = "[bright_green]●[/]"
+            elif cpu_f > 1:  dot = "[yellow]◐[/]"
+            else:            dot = "[#585b70]○[/]"
+        except ValueError:
+            dot = "[#585b70]○[/]"
+
+        summary = (s["summary"] or s["first_prompt"] or "Session")[:36]
+        pid = proc.get("pid", "—")
+        model = short_model(s["model"])
+
+        # Main agent — elapsed right-aligned
+        lines.append(f"  {dot} [b]Main Agent[/]                  [dim]{elapsed}[/]")
+
+        has_kids = bool(s["subagents"])
+        trunk = "│" if has_kids else " "
+        lines.append(f"  {trunk}   [dim]{summary}[/]")
+        lines.append(f"  {trunk}   [dim]PID {pid} · {model}[/]")
+
+        mcps = proc.get("mcp_servers", [])
+        if mcps:
+            mcp_badges = " ".join(f"[bold on #45475a] {m} [/]" for m in mcps)
+            lines.append(f"  {trunk}   {mcp_badges}")
+
+        if has_kids:
+            for i, sa in enumerate(s["subagents"]):
+                is_last = (i == len(s["subagents"]) - 1)
+                branch_ch = "└" if is_last else "├"
+                connector = " " if is_last else "│"
+
+                # Status dot + [RUNNING] badge
+                if sa["status"] == "active":
+                    sa_dot = "[bright_green]●[/]"
+                    running = " [bold bright_green]\\[RUNNING][/]"
+                elif sa["messages"] > 0:
+                    sa_dot = "[green]✓[/]"
+                    running = ""
+                else:
+                    sa_dot = "[#585b70]○[/]"
+                    running = " [dim]pending[/]"
+
+                task_short = sa.get("task", "")[:30]
+
+                # Color-coded type badge
+                badge = agent_badge(sa["type"])
+                lines.append(
+                    f"  {branch_ch}── {sa_dot} {badge}{running}"
+                )
+                if task_short:
+                    lines.append(
+                        f"  {connector}      [dim]{task_short}[/]"
+                    )
+
+                # Nested tool usage
+                tools = sa["tools_used"][:4]
+                if tools:
+                    for j, tool in enumerate(tools):
+                        is_tool_last = (j == len(tools) - 1)
+                        t_ch = "└" if is_tool_last else "├"
+                        tc = TOOL_COLOR.get(tool, "#cdd6f4")
+                        lines.append(
+                            f"  {connector}      {t_ch}── [green]✓[/] [{tc}]{tool}[/]"
+                        )
+
+        widget.update("\n".join(lines))
+
+    # ── Tasks ────────────────────────────────────────────────────────────
+
+    def _render_tasks(self, s):
+        widget = self.query_one("#tasks-content", Static)
+        lines = []
+
+        if s["tasks"]:
+            # ── Formal tasks from Claude's task system ────────────────
+            completed = sum(1 for t in s["tasks"] if t["status"] == "completed")
+            in_prog = sum(1 for t in s["tasks"] if t["status"] == "in_progress")
+            pending = len(s["tasks"]) - completed - in_prog
+
+            lines.append(
+                f"  [green]{completed} done[/]  "
+                f"[yellow]{in_prog} active[/]  "
+                f"[dim]{pending} pending[/]"
+            )
+            lines.append("")
+
+            for task in s["tasks"]:
+                status = task["status"]
+                subject = task["subject"][:42]
+                active = task.get("active_form", "")
+                blocked_by = task.get("blocked_by", [])
+
+                if status == "completed":
+                    lines.append(f"  [green]\\[✓][/] {subject}")
+                elif status == "in_progress":
+                    lines.append(
+                        f"  [yellow]\\[→][/] {subject}  ← [yellow b]in-progress[/]"
+                    )
+                    if active:
+                        lines.append(f"       [dim italic]{active}[/]")
+                    if blocked_by:
+                        lines.append(f"       [dim]blocked by: task {', '.join(blocked_by)}[/]")
+                elif status == "blocked":
+                    lines.append(
+                        f"  [red]\\[✗][/] {subject}  ← [red]blocked[/]"
+                    )
+                    if blocked_by:
+                        lines.append(f"       [dim]blocked by: task {', '.join(blocked_by)}[/]")
+                else:
+                    lines.append(f"  [#585b70]\\[ ][/] {subject}")
+
+        elif s["steps"]:
+            # ── Derived checklist from Agent calls + user messages ────
+            # Deduplicate and show as checklist
+            seen = set()
+            steps = []
+            for step in s["steps"]:
+                key = step["text"][:30]
+                if key not in seen:
+                    seen.add(key)
+                    steps.append(step)
+
+            # Mark the last step as "in_progress" if session is active
+            proc = s.get("_proc") or {}
+            try:
+                cpu_f = float(proc.get("cpu", "0"))
+            except ValueError:
+                cpu_f = 0
+            is_active = cpu_f > 1
+
+            for i, step in enumerate(steps):
+                text = step["text"][:45]
+                is_last_step = (i == len(steps) - 1)
+
+                if is_last_step and is_active:
+                    # Current step in progress
+                    lines.append(
+                        f"  [yellow]\\[→][/] {text}  ← [yellow b]in-progress[/]"
+                    )
+                else:
+                    # Completed step
+                    lines.append(f"  [green]\\[✓][/] {text}")
+
+        else:
+            # ── No tasks, no steps — show session summary ────────────
+            summary = s["summary"] or s["first_prompt"]
+            if summary:
+                lines.append(f"  [green]\\[✓][/] {summary[:45]}")
+            else:
+                lines.append("  [dim]No activity yet[/]")
+
+        widget.update("\n".join(lines))
+
+    # ── Session Stats ────────────────────────────────────────────────────
+
+    def _render_stats(self, s, proc):
+        widget = self.query_one("#stats-content", Static)
+
+        model = s["model"]
+        model_short = short_model(model)
+        t_in = s["input_tokens"] + s["cache_read"]
+        t_out = s["output_tokens"]
+        cost = calc_cost(s["input_tokens"], s["output_tokens"],
+                         s["cache_read"], s["cache_write"], model)
+
+        # Context bar
+        ctx_window = 200_000
+        ctx_pct = min(100, t_in / ctx_window * 100) if ctx_window else 0
+        bar_w = 14
+        filled = int(ctx_pct / 100 * bar_w)
+        if ctx_pct < 50:     bc = "green"
+        elif ctx_pct < 75:   bc = "yellow"
+        elif ctx_pct < 90:   bc = "bright_red"
+        else:                bc = "bold red"
+        ctx_bar = f"[{bc}]{'█' * filled}[/][#45475a]{'█' * (bar_w - filled)}[/]"
+
+        elapsed = proc.get("elapsed", "—")
+        active_agents = sum(1 for sa in s["subagents"] if sa["status"] == "active")
+        total_agents = len(s["subagents"])
+
+        try:
+            cpu_f = float(proc.get("cpu", "0"))
+        except ValueError:
+            cpu_f = 0
+        self.cpu_history.append(cpu_f)
+        if len(self.cpu_history) > 40:
+            self.cpu_history = self.cpu_history[-40:]
+        spark = build_spark(self.cpu_history)
+
+        lines = [
+            "",
+            f"  [b]Model[/]       [cyan]{model_short}[/]",
+            f"  [b]Context[/]     {ctx_bar} {ctx_pct:.1f}%",
+            f"  [b]Tokens In[/]   {fmt_tokens(s['input_tokens'])}",
+            f"  [b]Tokens Out[/]  {fmt_tokens(t_out)}",
+            f"  [b]Cache Read[/]  {fmt_tokens(s['cache_read'])}",
+            f"  [b]Cache Write[/] {fmt_tokens(s['cache_write'])}",
+            f"  [b]Cost[/]        [bold red]{fmt_cost(cost)}[/]",
+            f"  [b]Agents[/]      {total_agents} ({active_agents} active)",
+            f"  [b]Duration[/]    {elapsed}",
+            "",
+            f"  [dim]CPU[/] [bright_green]{spark}[/]",
+        ]
+
+        gstats = get_global_stats()
+        if gstats:
+            mu = gstats.get("modelUsage", {})
+            all_cost = sum(
+                calc_cost(v.get("inputTokens",0), v.get("outputTokens",0),
+                          v.get("cacheReadInputTokens",0), v.get("cacheCreationInputTokens",0), k)
+                for k, v in mu.items()
+            )
+            lines.append(f"  [dim]All-time:[/] [bold]{fmt_cost(all_cost)}[/]")
+
+        widget.update("\n".join(lines))
+
+    # ── Activity Log ─────────────────────────────────────────────────────
+
+    def _render_activity(self, s):
+        widget = self.query_one("#activity-content", Static)
+        lines = []
+
+        recent = s["activity"][-self.log_lines:]
+        if not recent:
+            lines.append("  [dim]No recent activity[/]")
+        else:
+            for act in recent:
+                time_str = act["time"] or "        "
+                agent = act["agent"]
+                tool = act["tool"]
+                detail = act["detail"]
+
+                # Color-coded agent badge
+                ac = agent_color(agent)
+                agent_str = f"[bold {ac}]\\[{agent:>7}][/]"
+
+                # Status sphere per line
+                if act["is_side"]:
+                    sphere = f"[{ac}]●[/]"
+                else:
+                    sphere = "[cyan]●[/]"
+
+                # Tool with color
+                tc = TOOL_COLOR.get(tool, "#cdd6f4")
+                tool_str = f"[{tc}]Tool:{tool:<10}[/]"
+
+                lines.append(
+                    f"  {sphere} [dim]{time_str}[/]  {agent_str}  {tool_str} {detail}"
+                )
+
+        widget.update("\n".join(lines))
+
+    # ── Footer ───────────────────────────────────────────────────────────
+
+    def _render_footer(self, s, proc):
+        widget = self.query_one("#footer-bar", Static)
+
+        cpu = proc.get("cpu", "0")
+        try:
+            cpu_f = float(cpu)
+        except ValueError:
+            cpu_f = 0
+
+        if s["activity"]:
+            last = s["activity"][-1]
+            if cpu_f > 5:
+                widget.update(
+                    f"[#1e1e2e]→ {last['time']} "
+                    f"\\[{last['agent']}] Tool:{last['tool']}  {last['detail'][:50]}[/]"
+                )
+            else:
+                widget.update(
+                    f"[#1e1e2e]→ Waiting for input… │ "
+                    f"Last: {last['tool']}  {last['detail'][:40]}[/]"
+                )
+        else:
+            widget.update("[#1e1e2e]→ Session idle[/]")
+
+
+if __name__ == "__main__":
+    ClaudeMonitor().run()
