@@ -15,14 +15,36 @@ dirs), so it needs no API key and sends nothing to the network.
 
 ---
 
+## Screenshots
+
+The dashboard: the Conversations list on the left, with the selected session's
+agent tree, tasks, and stats.
+
+![Dashboard](screenshots/01-dashboard.svg)
+
+Pin the conversations you care about — they group at the top, above a divider.
+
+![Pinned conversations](screenshots/02-pinned.svg)
+
+Double-click a conversation to open its colored transcript (and, on a live
+session, send it a message right from the box at the bottom).
+
+![Chat transcript](screenshots/03-chat-transcript.svg)
+
+> Screenshots use mock demo data.
+
+---
+
 ## Features
 
-- **Recent tasks, all accounts** — one list of your live and recent Claude Code
-  sessions, newest first, with an account badge, a busy/idle/ended dot, branch,
-  summary, tokens, and cost.
-- **Session dashboard** — single-click a task to point the Agent Tree, Tasks, and
-  Session Stats panels at it.
-- **Open the chat** — double-click a task to open an embedded conversation pane.
+- **Conversations, all accounts** — one list of your live and recent Claude Code
+  sessions, newest first, with an account badge, a busy/idle/ended dot, the clean
+  session name (e.g. `api-auth`), summary, tokens, and cost.
+- **Pinned section** — pin the conversations you care about; they group at the top
+  above a divider and survive restarts.
+- **Session dashboard** — single-click a conversation to point the Agent Tree,
+  Tasks, and Session Stats panels at it.
+- **Open the chat** — double-click a conversation to open an embedded pane.
 - **Colored transcript** — a readable, syntax-lit reconstruction of the
   conversation (you / assistant / tool calls) tailed from the session log.
 - **Live screen mirror** — see the real terminal output of a running session
@@ -31,7 +53,6 @@ dirs), so it needs no API key and sends nothing to the network.
   live session (macOS + iTerm2).
 - **Jump to the tab** — focus the exact iTerm2 tab running a session (macOS +
   iTerm2).
-- **Pin** conversations so they stay at the top and survive restarts.
 - **Resume list** — browse every past conversation across all accounts and open
   it.
 
@@ -45,7 +66,7 @@ need **macOS with [iTerm2](https://iterm2.com)**.
 
 | Feature | Requirement |
 | --- | --- |
-| Recent tasks, dashboard, transcript, stats, pins, resume | any OS |
+| Conversations list, dashboard, transcript, stats, pins, resume | any OS |
 | Jump to tab, live screen mirror, send input, attach image | macOS + iTerm2 |
 
 On Linux/Windows the terminal-driving keys simply show a notice; everything else
