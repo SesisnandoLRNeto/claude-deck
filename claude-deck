@@ -249,18 +249,24 @@ def send_text_to_tty(proc_tty, text):
         return False
 
 
-# Opens a brand-new Claude Code session in a fresh iTerm2 tab.
+# Starts a brand-new Claude Code session in a BACKGROUND iTerm2 tab and keeps the
+# deck's own tab selected, so the deck stays in front. The new session is then
+# surfaced inside the deck's embedded chat — the tab is just a hidden engine.
 NEW_CHAT_APPLESCRIPT = r'''
 on run argv
     set theCmd to item 1 of argv
     tell application "iTerm2"
-        activate
         if (count of windows) = 0 then
             create window with default profile
+            tell current session of current window to write text theCmd
         else
-            tell current window to create tab with default profile
+            set deckTab to current tab of current window
+            tell current window
+                create tab with default profile
+                tell current session of current tab to write text theCmd
+                select deckTab
+            end tell
         end if
-        tell current session of current window to write text theCmd
     end tell
 end run
 '''
@@ -1094,6 +1100,7 @@ class ClaudeMonitor(App):
         self._last_click_sid = None    # for single- vs double-click detection
         self._last_click_time = 0.0
         self.pending_images = []        # image paths queued to send with the next message
+        self._pending_new_chat = None   # {sids, account, cwd, until} while a new chat boots
 
     def compose(self) -> ComposeResult:
         yield Static("⬡  CLAUDE DECK | MULTI-ACCOUNT CONTROL", id="header-bar")
@@ -1199,6 +1206,9 @@ class ClaudeMonitor(App):
         self.name_by_sid = {info["sessionId"]: info["name"]
                             for info in pid_index.values()
                             if info.get("sessionId") and info.get("name")}
+
+        if self._pending_new_chat:
+            self._check_pending_new_chat()
 
         self._render_list()
         self._render_selected()
@@ -1453,8 +1463,9 @@ class ClaudeMonitor(App):
                 pass
 
     def action_new_chat(self) -> None:
-        """`n` — open a brand-new claude session in a fresh iTerm2 tab, using the
-        account + folder of the highlighted (or open) conversation as context."""
+        """`n` — start a new claude session in a hidden background iTerm2 tab and
+        open it right here in the deck's chat once it boots. Account + folder come
+        from the highlighted (or open) conversation."""
         sid = self.focus_sid
         if not sid:
             item = self._highlighted_row()
@@ -1465,12 +1476,42 @@ class ClaudeMonitor(App):
         if acct is None and CONFIG_DIRS:
             acct = CONFIG_DIRS[0]                      # default: first (personal)
         name = acct["name"] if acct else "personal"
-        where = f" in {os.path.basename(cwd.rstrip('/'))}" if cwd and os.path.isdir(cwd) else ""
-        if open_new_chat(acct, cwd):
-            self.notify(f"New {name} chat opened{where}", timeout=2)
-        else:
+
+        before = {p.get("session_id") for p in self.all_processes if p.get("session_id")}
+        if not open_new_chat(acct, cwd):
             self.notify("Could not open a new chat (iTerm2 required)",
                         severity="warning", timeout=3)
+            return
+        # Wait for the new claude process to register, then enter its chat here.
+        self._pending_new_chat = {
+            "sids": before, "account": acct, "cwd": cwd,
+            "until": time.time() + 20,
+        }
+        self.notify(f"Starting a new {name} chat… opening it here", timeout=2)
+        # Claude takes a moment to register; poll a few times before the 3s tick.
+        for delay in (1.5, 3.0, 5.0, 8.0):
+            self.set_timer(delay, self.refresh_data)
+
+    def _check_pending_new_chat(self) -> None:
+        """Once the new session shows up as a live process, open it in the chat."""
+        pend = self._pending_new_chat
+        if not pend:
+            return
+        new = [p for p in self.all_processes
+               if p.get("session_id") and p["session_id"] not in pend["sids"]]
+        # Prefer the one matching the requested account + folder.
+        def matches(p):
+            acc_ok = (not pend["account"]) or (p.get("account") is pend["account"])
+            cwd_ok = (not pend["cwd"]) or (p.get("cwd") == pend["cwd"])
+            return acc_ok and cwd_ok
+        chosen = next((p for p in new if matches(p)), None) or (new[0] if new else None)
+        if chosen:
+            self._pending_new_chat = None
+            self._enter_focus(chosen["session_id"])
+        elif time.time() > pend["until"]:
+            self._pending_new_chat = None
+            self.notify("New chat did not appear — check the background iTerm2 tab",
+                        severity="warning", timeout=4)
 
     # ── Pins & Resume list ───────────────────────────────────────────────
 
