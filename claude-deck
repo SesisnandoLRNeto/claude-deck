@@ -564,9 +564,25 @@ def find_session_file_any(sid, config_dirs=CONFIG_DIRS):
     return None
 
 
+def _read_tail(path, nbytes=131072):
+    """Read the last nbytes of a file as text (for cheap name lookups)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            return f.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+_NAME_RE = re.compile(r'"(?:customTitle|agentName)":"((?:[^"\\]|\\.)*)"')
+
+
 def scan_session_meta(filepath, account):
-    """Cheap title + branch for the resume list — reads only the head of the
-    file (avoids a full parse_session over hundreds of historical sessions)."""
+    """Cheap metadata for the resume list. Reads the HEAD for branch + first
+    prompt, and the TAIL for the clean session name (custom-title / agent-name
+    records live deep in the file and persist near the end)."""
     sid = os.path.basename(filepath).replace(".jsonl", "")
     title, branch = "", ""
     try:
@@ -591,12 +607,21 @@ def scan_session_meta(filepath, account):
                         title = txt
     except Exception:
         pass
+    # The clean name (e.g. "ps-4412") — last occurrence in the file's tail.
+    matches = _NAME_RE.findall(_read_tail(filepath))
+    name = ""
+    if matches:
+        try:
+            name = json.loads('"' + matches[-1] + '"')
+        except Exception:
+            name = matches[-1]
     try:
         mtime = os.path.getmtime(filepath)
     except OSError:
         mtime = 0
     return {"session_id": sid, "filepath": filepath, "account": account,
-            "title": " ".join((title or sid).split()), "branch": branch, "mtime": mtime}
+            "name": name, "title": " ".join((title or sid).split()),
+            "branch": branch, "mtime": mtime}
 
 
 def list_all_sessions(config_dirs=CONFIG_DIRS, cap=200):
@@ -621,7 +646,7 @@ def parse_session(filepath, account=None):
         "input_tokens": 0, "output_tokens": 0,
         "cache_read": 0, "cache_write": 0,
         "messages": 0, "user_messages": 0, "tool_calls": 0,
-        "summary": "", "first_prompt": "",
+        "summary": "", "first_prompt": "", "name": "",
         "subagents": [], "activity": [], "tasks": [],
         "steps": [],  # derived checklist from user msgs + Agent calls
         "start_time": None,
@@ -725,6 +750,11 @@ def parse_session(filepath, account=None):
 
                 elif t == "summary":
                     stats["summary"] = msg.get("summary", "")
+
+                elif t == "custom-title" and msg.get("customTitle"):
+                    stats["name"] = msg["customTitle"]
+                elif t == "agent-name" and msg.get("agentName"):
+                    stats["name"] = msg["agentName"]
 
     except Exception:
         pass
@@ -846,7 +876,7 @@ def get_global_stats(config_dirs=CONFIG_DIRS):
 def session_label(sid, session, name_by_sid):
     """A clean, human name for a session: its Claude session name (e.g.
     'fusion-753', 'padmdrac-2') when known, else git branch, else cwd, else id."""
-    name = (name_by_sid or {}).get(sid)
+    name = (name_by_sid or {}).get(sid) or (session or {}).get("name")
     if name:
         return name
     branch = (session or {}).get("git_branch", "")
