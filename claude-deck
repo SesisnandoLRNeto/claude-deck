@@ -1246,6 +1246,7 @@ class ClaudeMonitor(App):
         self.name_by_sid = {}          # sid -> clean session name (e.g. 'fusion-753')
         self._last_click_sid = None    # for single- vs double-click detection
         self._last_click_time = 0.0
+        self._mouse_click_at = 0.0     # last real mouse click (vs keyboard Enter)
         self.pending_images = []        # image paths queued to send with the next message
         self.hosted = None              # a HostedSession the deck runs itself (new chat)
 
@@ -1442,13 +1443,23 @@ class ClaudeMonitor(App):
             self.notify("Session ended — nothing to jump to",
                         severity="information", timeout=2)
 
+    def on_click(self, event) -> None:
+        # Record mouse-click time so the row handler can tell a click from a
+        # keyboard Enter (both raise ListView.Selected, but only a click fires
+        # this first).
+        self._mouse_click_at = time.time()
+
     def on_list_view_selected(self, event) -> None:
-        # Single click / Enter -> show that session's dashboard panels.
-        # Double click / double Enter -> open the embedded conversation (chat).
+        # Keyboard Enter -> open the chat directly.
+        # Mouse: single click -> dashboard panels, double click -> chat.
         if not isinstance(event.item, TaskRow) or event.item.is_header:
             return
         sid = event.item.row_key
         now = time.time()
+        from_mouse = (now - self._mouse_click_at) < 0.3
+        if not from_mouse:
+            self._enter_focus(sid)          # keyboard Enter opens the chat
+            return
         double = (sid == self._last_click_sid and now - self._last_click_time < 0.45)
         self._last_click_sid = sid
         self._last_click_time = now

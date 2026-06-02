@@ -140,6 +140,7 @@ It refreshes every 3 seconds.
 | --- | --- |
 | `single click` | Show that session's dashboard (Agent Tree / Tasks / Stats) |
 | `double click` | Open the conversation (chat) pane |
+| `Enter` (on a highlighted row) | Open the conversation (chat) pane |
 | `m` | Toggle the chat between colored transcript and live screen mirror |
 | `i` | Queue the clipboard image to send with your next message (macOS + iTerm2) |
 | paste / drag and drop | Attach a pasted screenshot or dropped image files to the message |
