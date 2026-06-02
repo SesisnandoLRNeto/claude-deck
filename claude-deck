@@ -272,6 +272,7 @@ class HostedSession:
         self.proc = None
         self.alive = False
         self.status = "starting"
+        self.display_name = "new chat"
         self._stderr = []
 
     def start(self):
@@ -1691,8 +1692,20 @@ class ClaudeMonitor(App):
             return
         inp = self.query_one("#focus-input", ChatInput)
 
-        # Deck-hosted chat: send straight to the child claude over its pipe.
+        # Deck-hosted chat.
         if self.focus_sid == "__hosted__":
+            # /rename is a UI-only command Claude can't run headless, so the deck
+            # handles it: name the chat here instead of sending it to the model.
+            if text.lower().startswith("/rename"):
+                newname = text[len("/rename"):].strip()
+                if newname and self.hosted:
+                    self.hosted.display_name = newname[:40]
+                    inp.text = ""
+                    self.notify(f"Chat renamed to “{newname[:40]}”", timeout=2)
+                    self._render_focus()
+                else:
+                    self.notify("Usage: /rename <name>", severity="warning", timeout=2)
+                return
             msg = " ".join([text] + images).strip()
             if self.hosted and self.hosted.send(msg):
                 inp.text = ""
@@ -1774,9 +1787,10 @@ class ClaudeMonitor(App):
             h = self.hosted
             acct = (h.account if h else None) or {}
             status = h.status if h else "gone"
+            chat_name = h.display_name if h else "new chat"
             title.update(
                 f"[bold {acct.get('color', '#cdd6f4')}]{acct.get('name', '?')}[/]  "
-                f"[b]new chat[/]  [dim]hosted · {status}[/]   [dim](esc: back)[/]"
+                f"[b]{rich_escape(chat_name)}[/]  [dim]hosted · {status}[/]   [dim](esc: back)[/]"
             )
             if h and h.entries:
                 content.update(Text.from_markup(self._format_transcript(h.entries)))

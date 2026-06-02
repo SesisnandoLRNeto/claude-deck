@@ -161,6 +161,16 @@ process in headless stream-json mode and renders the conversation in the pane.
 There is no iTerm2 tab and no second window. `Esc` leaves it running in the
 background; press `n` again to return to it.
 
+### Slash commands in the hosted chat
+
+Your skill and command-file commands work here — type `/brainstorm`, `/commit`,
+`/docs`, `/code-review`, etc. and press Enter. Built-ins that act on the
+interactive app (`/rename`, `/config`) are not available headless; if you type
+one, Claude just treats it as text. The deck handles `/rename <name>` itself, so
+you can still name a hosted chat (the name shows in the chat header).
+
+### Permissions
+
 Because a hosted agent runs without an interactive approval prompt, you choose
 its tool-permission policy with an environment variable:
 
