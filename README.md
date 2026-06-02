@@ -57,11 +57,12 @@ session, send it a message right from the box at the bottom).
   iTerm2).
 - **Resume list** — browse every past conversation across all accounts and open
   it.
-- **New chat** — press `n` to start a brand-new Claude Code session and open it
-  right inside the deck's chat pane. The session runs in a hidden background
-  iTerm2 tab (the deck stays in front); you talk to it from the deck. It uses the
+- **New chat, hosted by the deck** — press `n` to start a brand-new Claude
+  session that the deck runs itself, as a child process, and chat with it right
+  in the pane. No iTerm2 tab and no other window: the deck spawns `claude` in
+  headless stream-json mode and renders the conversation live. It uses the
   account and folder of the highlighted conversation as context (highlight a work
-  row to start a work chat) (macOS + iTerm2).
+  row to start a work chat). Works on any OS.
 
 ---
 
@@ -74,7 +75,8 @@ need **macOS with [iTerm2](https://iterm2.com)**.
 | Feature | Requirement |
 | --- | --- |
 | Conversations list, dashboard, transcript, stats, pins, resume | any OS |
-| Jump to tab, live screen mirror, send input, attach image | macOS + iTerm2 |
+| New chat hosted by the deck (`n`) | any OS |
+| Jump to tab, live screen mirror, send input/images to an existing session | macOS + iTerm2 |
 
 On Linux/Windows the terminal-driving keys simply show a notice; everything else
 works.
@@ -143,11 +145,35 @@ It refreshes every 3 seconds.
 | paste / drag and drop | Attach a pasted screenshot or dropped image files to the message |
 | `Enter` (in the input box) | Send your message (and any queued images) to the live session |
 | `j` | Jump to the real iTerm2 tab of the highlighted session |
-| `n` | Start a new Claude Code session and open it inside the deck (runs in a hidden tab; uses the highlighted row's account + folder) |
+| `n` | Start a new chat that the deck hosts itself, and open it in the pane (uses the highlighted row's account + folder) |
 | `p` | Pin / unpin the highlighted conversation |
 | `R` | Toggle the list between recent and all conversations (resume) |
-| `Esc` | Back from the chat to the dashboard |
+| `Esc` | Back from the chat to the dashboard (a hosted chat keeps running in the background) |
 | `q` | Quit |
+
+---
+
+## The hosted new chat (`n`)
+
+`n` starts a Claude session that the deck owns: it runs `claude` as a child
+process in headless stream-json mode and renders the conversation in the pane.
+There is no iTerm2 tab and no second window. `Esc` leaves it running in the
+background; press `n` again to return to it.
+
+Because a hosted agent runs without an interactive approval prompt, you choose
+its tool-permission policy with an environment variable:
+
+```bash
+# default: auto-accept file edits, but the agent will not run shell commands
+export CLAUDE_DECK_PERMISSION_MODE=acceptEdits
+
+# fully autonomous: the agent can run any tool, including shell commands,
+# without asking. Powerful and riskier — only on code you trust.
+export CLAUDE_DECK_PERMISSION_MODE=bypassPermissions
+```
+
+This is separate from the **send input** feature, which types into an existing
+iTerm2 session you already started yourself.
 
 ---
 
