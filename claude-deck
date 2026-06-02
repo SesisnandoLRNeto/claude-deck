@@ -17,8 +17,9 @@ from pathlib import Path
 
 try:
     from textual.app import App, ComposeResult
-    from textual.widgets import Static, ListView, ListItem, Label, Button, Input
+    from textual.widgets import Static, ListView, ListItem, Label, Button, Input, TextArea
     from textual.containers import Vertical, Horizontal, VerticalScroll
+    from textual.message import Message
     from rich.text import Text
     from rich.markup import escape as rich_escape
 except ImportError:
@@ -1047,6 +1048,33 @@ def build_transcript(filepath, tail=80):
     return entries[-tail:]
 
 
+class ChatInput(TextArea):
+    """Multi-line chat box that soft-wraps and grows with its content. Enter
+    sends the message; Shift+Enter (or Ctrl+J) inserts a newline."""
+
+    class Submitted(Message):
+        def __init__(self, text):
+            self.text = text
+            super().__init__()
+
+    NEWLINE_KEYS = ("shift+enter", "ctrl+j")
+
+    def _on_key(self, event):
+        if event.key == "escape":
+            return  # let it bubble up to the app (Back) instead of capturing it
+        if event.key in self.NEWLINE_KEYS:
+            event.prevent_default()
+            event.stop()
+            self.insert("\n")
+            return
+        if event.key == "enter":
+            event.prevent_default()
+            event.stop()
+            self.post_message(self.Submitted(self.text))
+            return
+        super()._on_key(event)
+
+
 class TaskRow(ListItem):
     """A row in the conversations list. Either a real chat (carries tty + session
     id) or a non-selectable section header (is_header=True)."""
@@ -1157,7 +1185,9 @@ class ClaudeMonitor(App):
     }
     #focus-input {
         dock: bottom;
-        height: 3;
+        height: auto;
+        min-height: 3;
+        max-height: 12;
         background: #181825;
         border: tall #45475a;
     }
@@ -1242,9 +1272,9 @@ class ClaudeMonitor(App):
                 id="focus-toolbar",
             ),
             VerticalScroll(Static("", id="focus-content"), id="focus-scroll"),
-            Input(placeholder="Type a message and press Enter — "
-                               "paste/drag images or press i to attach",
-                  id="focus-input"),
+            ChatInput(soft_wrap=True, id="focus-input",
+                      placeholder="Type a message and press Enter — "
+                                  "Shift+Enter for a newline · paste/drag images or i to attach"),
             id="focus-panel",
         )
         focus_panel.border_title = "Conversation"
@@ -1480,7 +1510,7 @@ class ClaudeMonitor(App):
         self.query_one("#focus-panel").display = True
         self._render_focus()
         # Focus the input so typing, paste, and dropped files land in the chat.
-        self.query_one("#focus-input", Input).focus()
+        self.query_one("#focus-input", ChatInput).focus()
 
     def _exit_focus(self) -> None:
         self.focus_sid = None
@@ -1525,7 +1555,7 @@ class ClaudeMonitor(App):
     def _update_input_hint(self) -> None:
         """Reflect queued images in the input's placeholder."""
         try:
-            inp = self.query_one("#focus-input", Input)
+            inp = self.query_one("#focus-input", ChatInput)
         except Exception:
             return
         n = len(self.pending_images)
@@ -1560,7 +1590,7 @@ class ClaudeMonitor(App):
         if not self.focus_sid:
             return
         text = getattr(event, "text", "") or ""
-        inp = self.query_one("#focus-input", Input)
+        inp = self.query_one("#focus-input", ChatInput)
         input_focused = self.focused is inp
         if text.strip():
             imgs, _rest = extract_image_paths(text)
@@ -1621,7 +1651,7 @@ class ClaudeMonitor(App):
             self.query_one(pid).display = False
         self.query_one("#focus-panel").display = True
         self._render_focus()
-        self.query_one("#focus-input", Input).focus()
+        self.query_one("#focus-input", ChatInput).focus()
 
     # ── Pins & Resume list ───────────────────────────────────────────────
 
@@ -1652,21 +1682,20 @@ class ClaudeMonitor(App):
 
     # ── Send input to a live session ─────────────────────────────────────
 
-    def on_input_submitted(self, event) -> None:
-        if event.input.id != "focus-input":
-            return
+    def on_chat_input_submitted(self, event) -> None:
         # Paths dropped into the box become image attachments; the rest is text.
-        dropped, text = extract_image_paths(event.value)
+        dropped, text = extract_image_paths(event.text)
         images = list(dict.fromkeys(self.pending_images + dropped))   # de-duped
         text = text.strip()
         if not text and not images:
             return
+        inp = self.query_one("#focus-input", ChatInput)
 
         # Deck-hosted chat: send straight to the child claude over its pipe.
         if self.focus_sid == "__hosted__":
             msg = " ".join([text] + images).strip()
             if self.hosted and self.hosted.send(msg):
-                event.input.value = ""
+                inp.text = ""
                 self.pending_images = []
                 self._update_input_hint()
                 self._render_focus()
@@ -1680,7 +1709,7 @@ class ClaudeMonitor(App):
         # Claude Code reads local image paths referenced in the message.
         msg = " ".join([text] + images).strip()
         if send_text_to_tty(tty, msg):
-            event.input.value = ""
+            inp.text = ""
             self.pending_images = []
             self._update_input_hint()
             self.focus_view = "mirror"      # show the result land in the terminal

@@ -143,7 +143,8 @@ It refreshes every 3 seconds.
 | `m` | Toggle the chat between colored transcript and live screen mirror |
 | `i` | Queue the clipboard image to send with your next message (macOS + iTerm2) |
 | paste / drag and drop | Attach a pasted screenshot or dropped image files to the message |
-| `Enter` (in the input box) | Send your message (and any queued images) to the live session |
+| `Enter` (in the input box) | Send your message (and any queued images) |
+| `Shift+Enter` | Insert a newline (the input wraps and grows as you type) |
 | `j` | Jump to the real iTerm2 tab of the highlighted session |
 | `n` | Start a new chat that the deck hosts itself, and open it in the pane (uses the highlighted row's account + folder) |
 | `p` | Pin / unpin the highlighted conversation |
