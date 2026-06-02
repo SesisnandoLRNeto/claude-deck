@@ -49,8 +49,10 @@ session, send it a message right from the box at the bottom).
   conversation (you / assistant / tool calls) tailed from the session log.
 - **Live screen mirror** — see the real terminal output of a running session
   without leaving the deck (macOS + iTerm2).
-- **Send input** — type a message (or attach a clipboard image) and send it to a
-  live session (macOS + iTerm2).
+- **Send input, with images** — type a message and send it to a live session.
+  Attach images the way you already do: paste a screenshot from the clipboard,
+  press `i`, or drag and drop one or more image files onto the input. They are
+  queued and sent together with your next message (macOS + iTerm2).
 - **Jump to the tab** — focus the exact iTerm2 tab running a session (macOS +
   iTerm2).
 - **Resume list** — browse every past conversation across all accounts and open
@@ -132,8 +134,9 @@ It refreshes every 3 seconds.
 | `single click` | Show that session's dashboard (Agent Tree / Tasks / Stats) |
 | `double click` | Open the conversation (chat) pane |
 | `m` | Toggle the chat between colored transcript and live screen mirror |
-| `i` | Attach the clipboard image to the message (macOS + iTerm2) |
-| `Enter` (in the input box) | Send your message to the live session |
+| `i` | Queue the clipboard image to send with your next message (macOS + iTerm2) |
+| paste / drag and drop | Attach a pasted screenshot or dropped image files to the message |
+| `Enter` (in the input box) | Send your message (and any queued images) to the live session |
 | `j` | Jump to the real iTerm2 tab of the highlighted session |
 | `p` | Pin / unpin the highlighted conversation |
 | `R` | Toggle the list between recent and all conversations (resume) |

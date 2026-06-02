@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -246,6 +247,30 @@ def send_text_to_tty(proc_tty, text):
         return r.returncode == 0 and r.stdout.strip() == "OK"
     except Exception:
         return False
+
+
+IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".tiff", ".svg")
+
+
+def extract_image_paths(text):
+    """Pull image file paths out of a message (e.g. dropped onto the input by
+    iTerm2, which inserts space-separated, possibly backslash-escaped paths).
+    Returns (image_paths, remaining_text). Cheap no-op when there's no image."""
+    low = text.lower()
+    if not any(ext in low for ext in IMG_EXT):
+        return [], text
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+    imgs, rest = [], []
+    for t in tokens:
+        p = os.path.expanduser(t)
+        if p.lower().endswith(IMG_EXT) and os.path.isfile(p):
+            imgs.append(p)
+        else:
+            rest.append(t)
+    return imgs, " ".join(rest)
 
 
 def clipboard_image_to_file():
@@ -1031,6 +1056,7 @@ class ClaudeMonitor(App):
         self.name_by_sid = {}          # sid -> clean session name (e.g. 'fusion-753')
         self._last_click_sid = None    # for single- vs double-click detection
         self._last_click_time = 0.0
+        self.pending_images = []        # image paths queued to send with the next message
 
     def compose(self) -> ComposeResult:
         yield Static("⬡  CLAUDE DECK | MULTI-ACCOUNT CONTROL", id="header-bar")
@@ -1056,7 +1082,8 @@ class ClaudeMonitor(App):
                 id="focus-toolbar",
             ),
             VerticalScroll(Static("", id="focus-content"), id="focus-scroll"),
-            Input(placeholder="Type a message and press Enter to send to this session…",
+            Input(placeholder="Type a message and press Enter — "
+                               "paste/drag images or press i to attach",
                   id="focus-input"),
             id="focus-panel",
         )
@@ -1274,6 +1301,8 @@ class ClaudeMonitor(App):
         if not sid:
             return
         self.focus_sid = sid
+        self.pending_images = []
+        self._update_input_hint()
         # Open on the colorful transcript by default; the live mirror is one
         # keypress away (m). Sending input flips to mirror to show the result.
         self.focus_view = "transcript"
@@ -1281,10 +1310,15 @@ class ClaudeMonitor(App):
             self.query_one(pid).display = False
         self.query_one("#focus-panel").display = True
         self._render_focus()
+        # Focus the input so typing, paste, and dropped files land in the chat.
+        self.query_one("#focus-input", Input).focus()
 
     def _exit_focus(self) -> None:
         self.focus_sid = None
+        self.pending_images = []
+        self._update_input_hint()
         self.query_one("#focus-panel").display = False
+        self.query_one("#recent-tasks", ListView).focus()
         for pid in self._DASHBOARD_PANELS:
             self.query_one(pid).display = True
 
@@ -1319,27 +1353,67 @@ class ClaudeMonitor(App):
         self.notify("This session is not live — cannot send", severity="warning", timeout=3)
         return None
 
+    def _update_input_hint(self) -> None:
+        """Reflect queued images in the input's placeholder."""
+        try:
+            inp = self.query_one("#focus-input", Input)
+        except Exception:
+            return
+        n = len(self.pending_images)
+        if n:
+            inp.placeholder = (f"{n} image{'s' if n != 1 else ''} attached — "
+                               f"add a message (optional) and press Enter to send")
+        else:
+            inp.placeholder = ("Type a message and press Enter — "
+                               "paste/drag images or press i to attach")
+
     def action_attach_image(self) -> None:
-        tty = self._live_focus_tty()
-        if not tty:
+        """`i` — queue the clipboard image to send with the next message."""
+        if not self.focus_sid:
+            self.notify("Open a conversation first", severity="warning", timeout=2)
             return
         img = clipboard_image_to_file()
         if not img:
             self.notify("No image in the clipboard (copy a screenshot first)",
                         severity="warning", timeout=3)
             return
+        self.pending_images.append(img)
+        self._update_input_hint()
+        self.notify(f"Image attached ({len(self.pending_images)} queued) — Enter to send",
+                    timeout=2)
+
+    def on_paste(self, event) -> None:
+        """Pasting (or dropping) into the chat.
+        - Files dropped while the input is focused land in the input as text and
+          are turned into attachments on send.
+        - Files dropped while the input is NOT focused are queued here.
+        - An empty paste (no text) means a screenshot is in the clipboard."""
+        if not self.focus_sid:
+            return
+        text = getattr(event, "text", "") or ""
         inp = self.query_one("#focus-input", Input)
-        text = inp.value.strip()
-        # Claude reads a local image path referenced in the message; pair it with
-        # any text already typed in the box.
-        msg = f"{text} {img}".strip() if text else img
-        if send_text_to_tty(tty, msg):
-            inp.value = ""
-            self.focus_view = "mirror"
-            self.set_timer(0.6, self._render_focus)
-            self.notify("Image sent", timeout=1)
-        else:
-            self.notify("Could not send the image", severity="warning", timeout=3)
+        input_focused = self.focused is inp
+        if text.strip():
+            imgs, _rest = extract_image_paths(text)
+            if imgs and not input_focused:
+                self.pending_images.extend(imgs)
+                self._update_input_hint()
+                self.notify(f"{len(imgs)} image(s) attached", timeout=1)
+                try:
+                    event.stop()
+                except Exception:
+                    pass
+            return
+        # Empty paste in a chat usually means a screenshot in the clipboard.
+        img = clipboard_image_to_file()
+        if img:
+            self.pending_images.append(img)
+            self._update_input_hint()
+            self.notify("Image attached (paste) — Enter to send", timeout=2)
+            try:
+                event.stop()
+            except Exception:
+                pass
 
     # ── Pins & Resume list ───────────────────────────────────────────────
 
@@ -1373,14 +1447,21 @@ class ClaudeMonitor(App):
     def on_input_submitted(self, event) -> None:
         if event.input.id != "focus-input":
             return
-        text = event.value
-        if not text.strip():
+        # Paths dropped into the box become image attachments; the rest is text.
+        dropped, text = extract_image_paths(event.value)
+        images = list(dict.fromkeys(self.pending_images + dropped))   # de-duped
+        text = text.strip()
+        if not text and not images:
             return
         tty = self._live_focus_tty()
         if not tty:
             return
-        if send_text_to_tty(tty, text):
+        # Claude Code reads local image paths referenced in the message.
+        msg = " ".join([text] + images).strip()
+        if send_text_to_tty(tty, msg):
             event.input.value = ""
+            self.pending_images = []
+            self._update_input_hint()
             self.focus_view = "mirror"      # show the result land in the terminal
             self.set_timer(0.5, self._render_focus)
         else:
