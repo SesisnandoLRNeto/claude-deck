@@ -249,6 +249,42 @@ def send_text_to_tty(proc_tty, text):
         return False
 
 
+# Opens a brand-new Claude Code session in a fresh iTerm2 tab.
+NEW_CHAT_APPLESCRIPT = r'''
+on run argv
+    set theCmd to item 1 of argv
+    tell application "iTerm2"
+        activate
+        if (count of windows) = 0 then
+            create window with default profile
+        else
+            tell current window to create tab with default profile
+        end if
+        tell current session of current window to write text theCmd
+    end tell
+end run
+'''
+
+
+def open_new_chat(account=None, cwd=None):
+    """Open a new `claude` session in a new iTerm2 tab, for the given account
+    (sets CLAUDE_CONFIG_DIR for non-default accounts) and optional directory."""
+    default = Path.home() / ".claude"
+    path = account.get("path") if account else None
+    env = ""
+    if path and Path(path) != default:
+        env = f"CLAUDE_CONFIG_DIR={shlex.quote(str(path))} "
+    cmd = f"{env}claude"
+    if cwd and os.path.isdir(cwd):
+        cmd = f"cd {shlex.quote(cwd)} && {cmd}"
+    try:
+        r = subprocess.run(["osascript", "-e", NEW_CHAT_APPLESCRIPT, cmd],
+                           capture_output=True, text=True, timeout=8)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".tiff", ".svg")
 
 
@@ -1032,6 +1068,7 @@ class ClaudeMonitor(App):
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
         ("j", "jump_current", "Jump"),
+        ("n", "new_chat", "New chat"),
         ("p", "toggle_pin", "Pin"),
         ("R", "toggle_resume", "Resume list"),
         ("m", "toggle_view", "Mirror/Transcript"),
@@ -1110,8 +1147,8 @@ class ClaudeMonitor(App):
 
     def _render_command_bar(self):
         self.query_one("#command-bar", Static).update(
-            "[b]click[/]:Panels  [b]2×click[/]:Chat  [b]m[/]:Mirror/Transcript  "
-            "[b]i[/]:Img  [b]esc[/]:Back  [b]j[/]:Jump  [b]p[/]:Pin  "
+            "[b]click[/]:Panels  [b]2×click[/]:Chat  [b]n[/]:New  [b]m[/]:Mirror/Transcript  "
+            "[b]esc[/]:Back  [b]j[/]:Jump  [b]p[/]:Pin  "
             "[b]R[/]:Resume-all  [b]q[/]:Quit  │  ↻ 3s"
         )
 
@@ -1414,6 +1451,26 @@ class ClaudeMonitor(App):
                 event.stop()
             except Exception:
                 pass
+
+    def action_new_chat(self) -> None:
+        """`n` — open a brand-new claude session in a fresh iTerm2 tab, using the
+        account + folder of the highlighted (or open) conversation as context."""
+        sid = self.focus_sid
+        if not sid:
+            item = self._highlighted_row()
+            sid = item.row_key if item else None
+        s = next((x for x in self.all_sessions if x["session_id"] == sid), None) if sid else None
+        acct = (s or {}).get("account")
+        cwd = ((s or {}).get("_proc") or {}).get("cwd")
+        if acct is None and CONFIG_DIRS:
+            acct = CONFIG_DIRS[0]                      # default: first (personal)
+        name = acct["name"] if acct else "personal"
+        where = f" in {os.path.basename(cwd.rstrip('/'))}" if cwd and os.path.isdir(cwd) else ""
+        if open_new_chat(acct, cwd):
+            self.notify(f"New {name} chat opened{where}", timeout=2)
+        else:
+            self.notify("Could not open a new chat (iTerm2 required)",
+                        severity="warning", timeout=3)
 
     # ── Pins & Resume list ───────────────────────────────────────────────
 

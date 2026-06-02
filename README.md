@@ -57,6 +57,9 @@ session, send it a message right from the box at the bottom).
   iTerm2).
 - **Resume list** — browse every past conversation across all accounts and open
   it.
+- **New chat** — press `n` to open a brand-new Claude Code session in a fresh
+  iTerm2 tab, using the account and folder of the highlighted conversation as
+  context (highlight a work row to start a work chat) (macOS + iTerm2).
 
 ---
 
@@ -138,6 +141,7 @@ It refreshes every 3 seconds.
 | paste / drag and drop | Attach a pasted screenshot or dropped image files to the message |
 | `Enter` (in the input box) | Send your message (and any queued images) to the live session |
 | `j` | Jump to the real iTerm2 tab of the highlighted session |
+| `n` | Open a new Claude Code session in a fresh iTerm2 tab (uses the highlighted row's account + folder) |
 | `p` | Pin / unpin the highlighted conversation |
 | `R` | Toggle the list between recent and all conversations (resume) |
 | `Esc` | Back from the chat to the dashboard |
