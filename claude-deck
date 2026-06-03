@@ -1247,6 +1247,7 @@ class ClaudeMonitor(App):
         self._last_click_sid = None    # for single- vs double-click detection
         self._last_click_time = 0.0
         self._mouse_click_at = 0.0     # last real mouse click (vs keyboard Enter)
+        self._focus_sig = None         # chat content signature for auto-scroll
         self.pending_images = []        # image paths queued to send with the next message
         self.hosted = None              # a HostedSession the deck runs itself (new chat)
 
@@ -1785,6 +1786,20 @@ class ClaudeMonitor(App):
                 out.append(self._md(text[:1500]))
         return "\n".join(out) if out else "[dim]No transcript yet.[/]"
 
+    def _scroll_chat_to_end(self) -> None:
+        try:
+            self.query_one("#focus-scroll", VerticalScroll).scroll_end(animate=False)
+        except Exception:
+            pass
+
+    def _update_chat(self, renderable, sig) -> None:
+        """Update the chat body and follow the latest content (auto-scroll to the
+        bottom) whenever it grows, so you always see the newest interaction."""
+        self.query_one("#focus-content", Static).update(renderable)
+        if sig != self._focus_sig:
+            self._focus_sig = sig
+            self.call_after_refresh(self._scroll_chat_to_end)
+
     def _render_focus(self) -> None:
         if not self.focus_sid:
             return
@@ -1804,7 +1819,9 @@ class ClaudeMonitor(App):
                 f"[b]{rich_escape(chat_name)}[/]  [dim]hosted · {status}[/]   [dim](esc: back)[/]"
             )
             if h and h.entries:
-                content.update(Text.from_markup(self._format_transcript(h.entries)))
+                last_len = len(h.entries[-1][1])
+                self._update_chat(Text.from_markup(self._format_transcript(h.entries)),
+                                  ("hosted", len(h.entries), last_len))
             else:
                 content.update("[dim]Starting Claude… type your first message below "
                                "and press Enter.[/]")
@@ -1847,13 +1864,15 @@ class ClaudeMonitor(App):
                     content.update("[yellow]Could not read the screen from iTerm2.[/]\n"
                                    "Press [b]m[/] for the transcript instead.")
                 else:
-                    content.update(Text(screen.rstrip("\n")))   # literal, no markup
+                    self._update_chat(Text(screen.rstrip("\n")),
+                                      ("mirror", sid, len(screen)))
             else:
                 content.update("[dim]Not live — no terminal to mirror.[/]\n"
                                "Press [b]m[/] for the transcript.")
         else:
             entries = build_transcript(filepath)
-            content.update(Text.from_markup(self._format_transcript(entries)))
+            self._update_chat(Text.from_markup(self._format_transcript(entries)),
+                              ("transcript", sid, len(entries)))
 
     def _render_selected(self):
         if not self.all_sessions:
