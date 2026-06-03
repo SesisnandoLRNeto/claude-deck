@@ -449,6 +449,32 @@ def clipboard_image_to_file():
     return None
 
 
+def copy_to_clipboard(text):
+    """Put plain text on the system clipboard. Returns True on success.
+
+    Textual captures the mouse, so the terminal's own text selection does not
+    work inside the deck; this gives a key-driven copy instead. Uses pbcopy on
+    macOS and the usual tools elsewhere."""
+    import shutil
+    if sys.platform == "darwin":
+        candidates = [["pbcopy"]]
+    elif sys.platform.startswith("win"):
+        candidates = [["clip"]]
+    else:
+        candidates = [["wl-copy"],
+                      ["xclip", "-selection", "clipboard"],
+                      ["xsel", "--clipboard", "--input"]]
+    for cmd in candidates:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, input=text.encode("utf-8"), check=True, timeout=5)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 # ── Data Collection ──────────────────────────────────────────────────────────
 
 def get_claude_processes():
@@ -1456,6 +1482,7 @@ class ClaudeMonitor(App):
         ("R", "toggle_resume", "Resume list"),
         ("m", "toggle_view", "Mirror/Transcript"),
         ("i", "attach_image", "Attach image"),
+        ("c", "copy_chat", "Copy chat"),
         ("escape", "back", "Back"),
         ("l", "cycle_log", "Log"),
     ]
@@ -1478,6 +1505,7 @@ class ClaudeMonitor(App):
         self._last_click_time = 0.0
         self._mouse_click_at = 0.0     # last real mouse click (vs keyboard Enter)
         self._focus_sig = None         # chat content signature for auto-scroll
+        self._focus_plain = ""         # plain text of the focused chat, for copy
         self.pending_images = []        # image paths queued to send with the next message
         self.hosted = None              # a HostedSession the deck runs itself (new chat)
         self.term = None                # a TerminalPane (real interactive claude)
@@ -1788,6 +1816,21 @@ class ClaudeMonitor(App):
         self.focus_view = "transcript" if self.focus_view == "mirror" else "mirror"
         self._render_focus()
 
+    def action_copy_chat(self) -> None:
+        """`c` — copy the currently shown chat (transcript or mirror) to the
+        clipboard, since the mouse cannot select text inside the TUI."""
+        if not self.focus_sid:
+            self.notify("Open a conversation first", severity="warning", timeout=2)
+            return
+        text = (self._focus_plain or "").strip()
+        if not text:
+            self.notify("Nothing to copy here", severity="warning", timeout=2)
+            return
+        if copy_to_clipboard(text):
+            self.notify(f"Copied {len(text)} chars to the clipboard", timeout=2)
+        else:
+            self.notify("Copy failed — no clipboard tool found", severity="warning", timeout=3)
+
     def on_button_pressed(self, event) -> None:
         if event.button.id == "focus-back":
             self._exit_focus()
@@ -2096,6 +2139,11 @@ class ClaudeMonitor(App):
         """Update the chat body and follow the latest content (auto-scroll to the
         bottom) whenever it grows, so you always see the newest interaction."""
         self.query_one("#focus-content", Static).update(renderable)
+        try:
+            self._focus_plain = (renderable.plain if hasattr(renderable, "plain")
+                                 else str(renderable))
+        except Exception:
+            self._focus_plain = ""
         if sig != self._focus_sig:
             self._focus_sig = sig
             self.call_after_refresh(self._scroll_chat_to_end)

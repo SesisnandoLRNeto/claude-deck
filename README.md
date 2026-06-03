@@ -146,6 +146,7 @@ It refreshes every 3 seconds.
 | `Enter` (on a highlighted row) | Open the conversation (chat) pane |
 | `m` | Toggle the chat between colored transcript and live screen mirror |
 | `i` | Queue the clipboard image to send with your next message (macOS + iTerm2) |
+| `c` | Copy the current chat (transcript or mirror) to the clipboard |
 | paste / drag and drop | Attach a pasted screenshot or dropped image files to the message |
 | `Enter` (in the input box) | Send your message (and any queued images) |
 | `Shift+Enter` | Insert a newline (the input wraps and grows as you type) |
