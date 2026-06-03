@@ -12,15 +12,28 @@ import threading
 import time
 import sys
 import glob
+import pty
+import fcntl
+import termios
+import struct
+import signal
+
+try:
+    import pyte
+    HAVE_PYTE = True
+except ImportError:
+    HAVE_PYTE = False
 from datetime import datetime
 from pathlib import Path
 
 try:
     from textual.app import App, ComposeResult
+    from textual.widget import Widget
     from textual.widgets import Static, ListView, ListItem, Label, Button, Input, TextArea
     from textual.containers import Vertical, Horizontal, VerticalScroll
     from textual.message import Message
     from rich.text import Text
+    from rich.style import Style
     from rich.markup import escape as rich_escape
 except ImportError:
     print("Missing dependencies. Install with:\n  pip3 install textual rich")
@@ -1076,6 +1089,203 @@ class ChatInput(TextArea):
         super()._on_key(event)
 
 
+_PYTE_COLORS = {
+    "black": "black", "red": "red", "green": "green", "brown": "yellow",
+    "blue": "blue", "magenta": "magenta", "cyan": "cyan", "white": "white",
+    "brightblack": "bright_black", "brightred": "bright_red",
+    "brightgreen": "bright_green", "brightyellow": "bright_yellow",
+    "brightblue": "bright_blue", "brightmagenta": "bright_magenta",
+    "brightcyan": "bright_cyan", "brightwhite": "bright_white",
+}
+
+
+def _pyte_color(c):
+    if not c or c == "default":
+        return None
+    if c in _PYTE_COLORS:
+        return _PYTE_COLORS[c]
+    if len(c) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in c):
+        return "#" + c
+    return c
+
+
+class TerminalPane(Widget, can_focus=True):
+    """A real pseudo-terminal embedded in the deck. Runs an interactive program
+    (claude) in a PTY, renders it with pyte, and forwards keystrokes — so the
+    full TUI works: mode switching, slash commands, per-step yes/no prompts.
+
+    Ctrl+B detaches back to the deck without killing the program."""
+
+    class Detached(Message):
+        pass
+
+    KEY_MAP = {
+        "enter": b"\r", "tab": b"\t", "backspace": b"\x7f", "escape": b"\x1b",
+        "up": b"\x1b[A", "down": b"\x1b[B", "right": b"\x1b[C", "left": b"\x1b[D",
+        "home": b"\x1b[H", "end": b"\x1b[F", "pageup": b"\x1b[5~",
+        "pagedown": b"\x1b[6~", "delete": b"\x1b[3~", "shift+tab": b"\x1b[Z",
+        "space": b" ",
+    }
+
+    def __init__(self, argv, env=None, cwd=None, **kw):
+        super().__init__(**kw)
+        self.argv = argv
+        self.env = env
+        self.cwd = cwd if (cwd and os.path.isdir(cwd)) else None
+        self.cols, self.rows = 80, 24
+        self.pid = None
+        self.master_fd = None
+        self.alive = False
+        self._screen = pyte.HistoryScreen(self.cols, self.rows, history=2000)
+        self._stream = pyte.ByteStream(self._screen)
+        self._queue = queue.Queue()
+
+    def on_mount(self):
+        w = max(20, self.size.width or 80)
+        h = max(6, self.size.height or 24)
+        self.cols, self.rows = w, h
+        self._screen.resize(h, w)
+        self._spawn()
+        self.set_interval(1 / 20, self._drain)
+        self.focus()
+
+    def _spawn(self):
+        try:
+            pid, fd = pty.fork()
+        except Exception:
+            return
+        if pid == 0:                       # child -> becomes the program
+            try:
+                if self.cwd:
+                    os.chdir(self.cwd)
+                os.environ["TERM"] = "xterm-256color"
+                os.execvpe(self.argv[0], self.argv, self.env or os.environ)
+            except Exception:
+                os._exit(1)
+        self.pid = pid
+        self.master_fd = fd
+        self.alive = True
+        self._set_winsize(self.rows, self.cols)
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _set_winsize(self, rows, cols):
+        if self.master_fd is not None:
+            try:
+                fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ,
+                            struct.pack("HHHH", rows, cols, 0, 0))
+            except Exception:
+                pass
+
+    def _reader(self):
+        while self.alive:
+            try:
+                data = os.read(self.master_fd, 8192)
+            except OSError:
+                break
+            if not data:
+                break
+            self._queue.put(data)
+        self.alive = False
+        self._queue.put(None)
+
+    def _drain(self):
+        changed = False
+        while True:
+            try:
+                data = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if data is None:
+                self.alive = False
+                continue
+            try:
+                self._stream.feed(data)
+            except Exception:
+                pass
+            changed = True
+        if changed:
+            self.refresh()
+
+    def on_resize(self, event):
+        w = max(20, self.size.width)
+        h = max(6, self.size.height)
+        if (w, h) != (self.cols, self.rows):
+            self.cols, self.rows = w, h
+            try:
+                self._screen.resize(h, w)
+            except Exception:
+                pass
+            self._set_winsize(h, w)
+            self.refresh()
+
+    def render(self):
+        scr = self._screen
+        cy, cx = scr.cursor.y, scr.cursor.x
+        text = Text()
+        for y in range(scr.lines):
+            row = scr.buffer[y]
+            for x in range(scr.columns):
+                ch = row[x]
+                data = ch.data if (ch.data and ch.data != "\x00") else " "
+                fg = _pyte_color(ch.fg)
+                bg = _pyte_color(ch.bg)
+                if ch.reverse:
+                    fg, bg = bg, fg
+                if y == cy and x == cx:      # draw the cursor as an inverse block
+                    fg, bg = (bg or "#1e1e2e"), (fg or "#cdd6f4")
+                text.append(data, Style(color=fg, bgcolor=bg, bold=ch.bold,
+                                        italic=ch.italics, underline=ch.underscore))
+            if y < scr.lines - 1:
+                text.append("\n")
+        return text
+
+    def _key_to_bytes(self, event):
+        k = event.key
+        if k == "ctrl+b":                  # reserved: detach back to the deck
+            return None
+        if k in self.KEY_MAP:
+            return self.KEY_MAP[k]
+        if k.startswith("ctrl+") and len(k) == 6 and "a" <= k[5] <= "z":
+            return bytes([ord(k[5]) - 96])
+        ch = event.character
+        if ch and ch.isprintable():
+            return ch.encode("utf-8")
+        return None
+
+    def on_key(self, event):
+        if event.key == "ctrl+b":
+            event.stop(); event.prevent_default()
+            self.post_message(self.Detached())
+            return
+        if not self.alive or self.master_fd is None:
+            return
+        data = self._key_to_bytes(event)
+        if data is not None:
+            event.stop(); event.prevent_default()
+            try:
+                os.write(self.master_fd, data)
+            except OSError:
+                pass
+
+    def shutdown(self):
+        self.alive = False
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+            except Exception:
+                pass
+            self.pid = None
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except Exception:
+                pass
+            self.master_fd = None
+
+    def on_unmount(self):
+        self.shutdown()
+
+
 class TaskRow(ListItem):
     """A row in the conversations list. Either a real chat (carries tty + session
     id) or a non-selectable section header (is_header=True)."""
@@ -1196,6 +1406,26 @@ class ClaudeMonitor(App):
         border: tall #89b4fa;
     }
 
+    #terminal-panel {
+        width: 1fr;
+        border: solid #a6e3a1;
+        border-title-color: #a6e3a1;
+        border-title-style: bold;
+        background: #1e1e2e;
+        display: none;
+    }
+    #term-toolbar {
+        height: 3;
+        background: #181825;
+    }
+    #term-title {
+        width: 1fr; height: 3;
+        content-align: left middle;
+        padding: 0 1;
+    }
+    #term-host { height: 1fr; }
+    TerminalPane { height: 1fr; }
+
     #bottom-row {
         height: auto; max-height: 10; min-height: 7;
         margin: 0 1;
@@ -1250,6 +1480,7 @@ class ClaudeMonitor(App):
         self._focus_sig = None         # chat content signature for auto-scroll
         self.pending_images = []        # image paths queued to send with the next message
         self.hosted = None              # a HostedSession the deck runs itself (new chat)
+        self.term = None                # a TerminalPane (real interactive claude)
 
     def compose(self) -> ComposeResult:
         yield Static("⬡  CLAUDE DECK | MULTI-ACCOUNT CONTROL", id="header-bar")
@@ -1282,8 +1513,19 @@ class ClaudeMonitor(App):
         )
         focus_panel.border_title = "Conversation"
 
+        terminal_panel = Vertical(
+            Horizontal(
+                Button("← Back (Ctrl+B)", id="term-back", variant="primary"),
+                Static("", id="term-title"),
+                id="term-toolbar",
+            ),
+            Vertical(id="term-host"),
+            id="terminal-panel",
+        )
+        terminal_panel.border_title = "Terminal · interactive Claude"
+
         yield Horizontal(recent_panel, tree_panel, tasks_panel, stats_panel,
-                         focus_panel, id="top-row")
+                         focus_panel, terminal_panel, id="top-row")
 
         activity_panel = VerticalScroll(Static("", id="activity-content"), id="bottom-row")
         activity_panel.border_title = "Activity"
@@ -1301,6 +1543,8 @@ class ClaudeMonitor(App):
     def on_unmount(self) -> None:
         if self.hosted:
             self.hosted.close()
+        if self.term:
+            self.term.shutdown()
 
     def _poll_hosted(self) -> None:
         if self.hosted and self.hosted.drain() and self.focus_sid == "__hosted__":
@@ -1551,6 +1795,8 @@ class ClaudeMonitor(App):
             self.action_toggle_view()
         elif event.button.id == "focus-attach":
             self.action_attach_image()
+        elif event.button.id == "term-back":
+            self._close_terminal()
 
     def _live_focus_tty(self):
         """tty of the focused session if it is live, else None (with a toast)."""
@@ -1628,15 +1874,20 @@ class ClaudeMonitor(App):
                 pass
 
     def action_new_chat(self) -> None:
-        """`n` — start a new Claude session that the DECK ITSELF hosts (no iTerm2
-        tab) and open it right here in the chat. Account + folder come from the
-        highlighted (or open) conversation."""
+        """`n` — start a new Claude session the deck runs itself. With pyte
+        available it embeds the REAL interactive claude (full TUI: mode switch,
+        slash commands, per-step yes/no). Otherwise it falls back to a headless
+        chat. Account + folder come from the highlighted (or open) conversation."""
+        # Re-attach to an already-running session if there is one.
+        if HAVE_PYTE and self.term and self.term.alive:
+            self._show_terminal()
+            return
         if self.hosted and self.hosted.alive:
             self._open_hosted()
             self.notify("Reopened the hosted chat", timeout=1)
             return
 
-        sid = self.focus_sid if self.focus_sid != "__hosted__" else None
+        sid = self.focus_sid if self.focus_sid not in ("__hosted__",) else None
         if not sid:
             item = self._highlighted_row()
             sid = item.row_key if item else None
@@ -1647,6 +1898,12 @@ class ClaudeMonitor(App):
             acct = CONFIG_DIRS[0]                      # default: first (personal)
         name = acct["name"] if acct else "personal"
 
+        if HAVE_PYTE:
+            self._open_terminal(acct, cwd)
+            where = f" in {os.path.basename(cwd.rstrip('/'))}" if cwd and os.path.isdir(cwd) else ""
+            self.notify(f"New {name} chat — interactive (Ctrl+B to detach){where}", timeout=3)
+            return
+
         self.hosted = HostedSession(acct, cwd)
         if not self.hosted.start():
             self.notify("Could not start Claude — is the `claude` CLI on your PATH?",
@@ -1656,6 +1913,49 @@ class ClaudeMonitor(App):
         self._open_hosted()
         where = f" in {os.path.basename(cwd.rstrip('/'))}" if cwd and os.path.isdir(cwd) else ""
         self.notify(f"New {name} chat (hosted by the deck){where}", timeout=3)
+
+    # ── Embedded interactive terminal (real claude TUI) ──────────────────
+
+    def _open_terminal(self, acct, cwd) -> None:
+        env = dict(os.environ)
+        path = acct.get("path") if acct else None
+        if path and Path(path) != (Path.home() / ".claude"):
+            env["CLAUDE_CONFIG_DIR"] = str(path)
+        # Tear down any focus/hosted view, hide the dashboard panels.
+        if self.focus_sid:
+            self.focus_sid = None
+            self.query_one("#focus-panel").display = False
+        for pid in self._DASHBOARD_PANELS:
+            self.query_one(pid).display = False
+        host = self.query_one("#term-host", Vertical)
+        if self.term:
+            self.term.shutdown()
+            self.term.remove()
+        self.term = TerminalPane([HOSTED_CLAUDE_BIN], env=env, cwd=cwd)
+        host.mount(self.term)
+        name = acct["name"] if acct else "personal"
+        color = acct["color"] if acct else "#cdd6f4"
+        self.query_one("#term-title", Static).update(
+            f"[bold {color}]{name}[/]  interactive claude   [dim](Ctrl+B to detach)[/]")
+        self.query_one("#terminal-panel").display = True
+
+    def _show_terminal(self) -> None:
+        for pid in self._DASHBOARD_PANELS:
+            self.query_one(pid).display = False
+        self.query_one("#focus-panel").display = False
+        self.query_one("#terminal-panel").display = True
+        if self.term:
+            self.term.focus()
+
+    def _close_terminal(self) -> None:
+        # Detach: hide the panel but keep the program running in the background.
+        self.query_one("#terminal-panel").display = False
+        for pid in self._DASHBOARD_PANELS:
+            self.query_one(pid).display = True
+        self.query_one("#recent-tasks", ListView).focus()
+
+    def on_terminal_pane_detached(self, event) -> None:
+        self._close_terminal()
 
     def _open_hosted(self) -> None:
         self.focus_sid = "__hosted__"

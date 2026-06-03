@@ -2,3 +2,8 @@
 # Tested with textual 8.1.1 and rich 14.3.3 on Python 3.9 (macOS).
 textual>=1.0
 rich>=13.0
+
+# Optional: enables the real interactive "new chat" (n) — embeds the live
+# claude TUI (mode switch, slash commands, per-step yes/no) inside the deck.
+# Without it, "new chat" falls back to a headless chat.
+pyte>=0.8

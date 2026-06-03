@@ -57,12 +57,15 @@ session, send it a message right from the box at the bottom).
   iTerm2).
 - **Resume list** — browse every past conversation across all accounts and open
   it.
-- **New chat, hosted by the deck** — press `n` to start a brand-new Claude
-  session that the deck runs itself, as a child process, and chat with it right
-  in the pane. No iTerm2 tab and no other window: the deck spawns `claude` in
-  headless stream-json mode and renders the conversation live. It uses the
-  account and folder of the highlighted conversation as context (highlight a work
-  row to start a work chat). Works on any OS.
+- **New chat — the real interactive Claude, inside the deck** — press `n` to
+  start a brand-new Claude session that the deck runs itself. With `pyte`
+  installed, it embeds the **real interactive `claude` TUI** in a pseudo-terminal:
+  mode switching (Shift+Tab), slash commands with autocomplete, and per-step
+  yes/no approval prompts all work, because it is the actual TUI. No iTerm2 tab
+  and no second window. `Ctrl+B` detaches back to the deck (the session keeps
+  running; press `n` to return to it). It uses the account and folder of the
+  highlighted conversation as context. Without `pyte`, `n` falls back to a
+  simpler headless chat. Works on any OS.
 
 ---
 
