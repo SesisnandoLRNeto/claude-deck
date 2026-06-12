@@ -1252,8 +1252,12 @@ class TerminalPane(Widget, can_focus=True):
                 if y == cy and x == cx:      # draw the cursor as an inverse block
                     fg, bg = (bg or "#1e1e2e"), (fg or "#cdd6f4")
                 try:
-                    style = Style(color=fg, bgcolor=bg, bold=ch.bold,
-                                  italic=ch.italics, underline=ch.underscore)
+                    # Underline is intentionally dropped: pyte over-applies it
+                    # for Claude's TUI (e.g. unterminated OSC-8 hyperlinks paint
+                    # whole lines underlined), which looks broken. Claude itself
+                    # emits no underline SGR, so nothing real is lost.
+                    style = Style(color=fg, bgcolor=bg,
+                                  bold=ch.bold, italic=ch.italics)
                 except Exception:
                     style = None
                 text.append(data, style)
