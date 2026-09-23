@@ -48,13 +48,13 @@ session, send it a message right from the box at the bottom).
 - **Colored transcript** — a readable, syntax-lit reconstruction of the
   conversation (you / assistant / tool calls) tailed from the session log.
 - **Live screen mirror** — see the real terminal output of a running session
-  without leaving the deck (macOS + iTerm2).
+  without leaving the deck (tmux on any OS, or macOS + iTerm2).
 - **Send input, with images** — type a message and send it to a live session.
   Attach images the way you already do: paste a screenshot from the clipboard,
   press `i`, or drag and drop one or more image files onto the input. They are
-  queued and sent together with your next message (macOS + iTerm2).
-- **Jump to the tab** — focus the exact iTerm2 tab running a session (macOS +
-  iTerm2).
+  queued and sent together with your next message (tmux on any OS, or macOS + iTerm2).
+- **Jump to the session** — focus the exact tmux pane or iTerm2 tab running a
+  session.
 - **Resume list** — browse every past conversation across all accounts and open
   it.
 - **New chat — the real interactive Claude, inside the deck** — press `n` to
@@ -72,17 +72,24 @@ session, send it a message right from the box at the bottom).
 ## Platform support
 
 The monitoring and reading features work on any OS. The features that drive your
-terminal (jump, mirror, send input, attach image) use AppleScript and therefore
-need **macOS with [iTerm2](https://iterm2.com)**.
+terminal (jump, mirror, send input, attach image) need to reach the session's
+terminal, and the deck has two ways to do that:
+
+- **tmux** (any OS): if the session runs inside tmux, the deck finds its pane by
+  TTY and uses plain `tmux` commands. It scans every tmux server of your user,
+  not only the default one, so sessions on their own socket (`tmux -L mine`) work
+  too. Nothing else is needed.
+- **iTerm2 + AppleScript** (macOS): the fallback for sessions that are not in
+  tmux, as before.
 
 | Feature | Requirement |
 | --- | --- |
 | Conversations list, dashboard, transcript, stats, pins, resume | any OS |
 | New chat hosted by the deck (`n`) | any OS |
-| Jump to tab, live screen mirror, send input/images to an existing session | macOS + iTerm2 |
+| Jump to pane, live screen mirror, send input/images to an existing session | session inside tmux (any OS), or macOS + iTerm2 |
 
-On Linux/Windows the terminal-driving keys simply show a notice; everything else
-works.
+Outside both cases the terminal-driving keys simply show a notice; everything
+else works. Set `CLAUDE_DECK_TMUX=0` to ignore tmux and always use iTerm2.
 
 ---
 
@@ -92,7 +99,7 @@ works.
 - [Claude Code](https://claude.com/claude-code) installed and used at least once
   (so there is data under `~/.claude`)
 - Python packages: `textual` and `rich` (see `requirements.txt`)
-- For jump / mirror / input / image: macOS and iTerm2
+- For jump / mirror / input / image: the session inside `tmux`, or macOS with iTerm2
 
 ---
 
@@ -145,12 +152,12 @@ It refreshes every 3 seconds.
 | `double click` | Open the conversation (chat) pane |
 | `Enter` (on a highlighted row) | Open the conversation (chat) pane |
 | `m` | Toggle the chat between colored transcript and live screen mirror |
-| `i` | Queue the clipboard image to send with your next message (macOS + iTerm2) |
+| `i` | Queue the clipboard image to send with your next message (macOS clipboard) |
 | `c` | Copy the current chat (transcript or mirror) to the clipboard |
 | paste / drag and drop | Attach a pasted screenshot or dropped image files to the message |
 | `Enter` (in the input box) | Send your message (and any queued images) |
 | `Shift+Enter` | Insert a newline (the input wraps and grows as you type) |
-| `j` | Jump to the real iTerm2 tab of the highlighted session |
+| `j` | Jump to the real tmux pane or iTerm2 tab of the highlighted session |
 | `n` | Start a new chat that the deck hosts itself, and open it in the pane (uses the highlighted row's account + folder) |
 | `p` | Pin / unpin the highlighted conversation |
 | `R` | Toggle the list between recent and all conversations (resume) |
@@ -214,8 +221,9 @@ script.
 - Each running process is matched to its session and account through
   `<config-dir>/sessions/<pid>.json`.
 - Conversations are read from `<config-dir>/projects/<cwd>/<session-id>.jsonl`.
-- Jump, mirror, and input talk to iTerm2 via `osascript`, matching the session's
-  TTY (e.g. `/dev/ttys006`).
+- Jump, mirror, and input find the session by its TTY (e.g. `/dev/ttys006`). If
+  that TTY belongs to a tmux pane, they use `tmux select-window`, `capture-pane`
+  and `send-keys`; otherwise they fall back to iTerm2 via `osascript`.
 - Pins are stored in `~/.claude/monitor-pins.json`.
 
 Nothing leaves your machine.
@@ -224,12 +232,14 @@ Nothing leaves your machine.
 
 ## Known limitations
 
-- The live mirror is plain text. iTerm2's scripting returns the screen contents
-  without color, so the mirror is uncolored; the transcript view is the colored
-  one.
+- The live mirror is plain text in both backends, so it is uncolored; the
+  transcript view is the colored one.
 - The mirror shows the visible viewport only (no scrollback).
-- Terminal-driving features are iTerm2-only for now. Support for other terminals
-  (Terminal.app, tmux, Kitty, WezTerm) is a good contribution.
+- Outside tmux, terminal-driving still needs macOS and iTerm2. Support for
+  Terminal.app, Kitty or WezTerm is a good contribution.
+- Jumping to a tmux pane selects it. When the deck runs on the same tmux server
+  it switches your client over; otherwise it selects the pane and, on macOS,
+  brings the terminal showing that tmux client to the front.
 
 ---
 
@@ -237,7 +247,7 @@ Nothing leaves your machine.
 
 This is meant to be customized by the community. Useful directions:
 
-- Support more terminals for jump/mirror/input.
+- Support more terminals for jump/mirror/input (tmux and iTerm2 are covered).
 - A colored mirror via the iTerm2 Python API.
 - Per-account filters, search, and sorting in the list.
 - Actually relaunch `claude --resume <id>` in a new tab from the resume list.

@@ -6,6 +6,7 @@ import os
 import queue
 import re
 import shlex
+import stat
 import subprocess
 import tempfile
 import threading
@@ -154,7 +155,7 @@ def agent_color(agent_type):
     return fg
 
 
-# ── iTerm2 jump-by-TTY ────────────────────────────────────────────────────────
+# ── iTerm2 backend (fallback when the session is not inside tmux) ────────────
 
 JUMP_APPLESCRIPT = r'''
 on run argv
@@ -179,7 +180,7 @@ end run
 '''
 
 
-def jump_to_tty(proc_tty):
+def _iterm_jump(proc_tty):
     """Focus the iTerm2 tab/pane whose tty matches. proc_tty is the ps column
     like 'ttys006' (no /dev/). Returns True only on a confirmed focus."""
     if not proc_tty or proc_tty in ("??", "?"):
@@ -214,7 +215,7 @@ end run
 '''
 
 
-def get_session_screen(proc_tty):
+def _iterm_screen(proc_tty):
     """Live screen text of the iTerm2 session on this tty, or None."""
     if not proc_tty or proc_tty in ("??", "?"):
         return None
@@ -252,7 +253,7 @@ end run
 '''
 
 
-def send_text_to_tty(proc_tty, text):
+def _iterm_send(proc_tty, text):
     """Type `text` into the iTerm2 session on this tty and submit it."""
     if not proc_tty or proc_tty in ("??", "?"):
         return False
@@ -263,6 +264,143 @@ def send_text_to_tty(proc_tty, text):
         return r.returncode == 0 and r.stdout.strip() == "OK"
     except Exception:
         return False
+
+
+# ── tmux backend ──────────────────────────────────────────────────────────────
+#
+# A Claude session running inside tmux is reachable without AppleScript: every pane
+# carries the tty that `ps` reports, so the deck can find the pane, read its screen and
+# type into it with plain tmux commands. That works on Linux, in any terminal emulator,
+# and over ssh. iTerm2 stays as the fallback for sessions outside tmux.
+#
+# Panes are looked up across every tmux server of this user, not only the default one,
+# because a session may run on its own socket (guild uses `tmux -L guild`).
+# Set CLAUDE_DECK_TMUX=0 to turn this off and always use iTerm2.
+
+TMUX_ENABLED = os.environ.get("CLAUDE_DECK_TMUX", "1") != "0"
+# `at` starts as None, not 0.0: time.monotonic() can itself start near zero,
+# and a 0.0 seed would make the empty first map look fresh.
+_TMUX_PANES = {"at": None, "map": {}}
+
+
+def _full_tty(proc_tty):
+    """ps prints 'ttys006'; tmux and AppleScript want '/dev/ttys006'."""
+    if not proc_tty or proc_tty in ("??", "?"):
+        return None
+    return proc_tty if proc_tty.startswith("/dev/") else f"/dev/{proc_tty}"
+
+
+def _tmux_sockets():
+    dirs = [os.environ.get("TMUX_TMPDIR"), f"/tmp/tmux-{os.getuid()}", f"/private/tmp/tmux-{os.getuid()}"]
+    out, seen = [], set()
+    for d in dirs:
+        if not d:
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(d, name)
+            try:
+                if not stat.S_ISSOCK(os.stat(path).st_mode):
+                    continue
+            except OSError:
+                continue
+            real = os.path.realpath(path)
+            if real not in seen:
+                seen.add(real)
+                out.append(path)
+    return out
+
+
+def _tmux(sock, *args, timeout=3):
+    try:
+        return subprocess.run(["tmux", "-S", sock, *args], capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def tmux_panes(max_age=1.0):
+    """{tty: (socket, 'session:window.pane', session)} for every pane of every server."""
+    now = time.monotonic()
+    if TMUX_ENABLED and _TMUX_PANES["at"] is not None and now - _TMUX_PANES["at"] < max_age:
+        return _TMUX_PANES["map"]
+    found = {}
+    if TMUX_ENABLED:
+        fmt = "#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}"
+        for sock in _tmux_sockets():
+            r = _tmux(sock, "list-panes", "-a", "-F", fmt)
+            if r is None or r.returncode != 0:
+                continue
+            for line in r.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) == 3:
+                    found[parts[0]] = (sock, parts[1], parts[2])
+    _TMUX_PANES.update(at=now, map=found)
+    return found
+
+
+def tmux_target(proc_tty):
+    """The tmux pane running on this tty, or None when the session is not in tmux."""
+    full = _full_tty(proc_tty)
+    return tmux_panes().get(full) if full else None
+
+
+def terminal_backend(proc_tty):
+    """Which backend owns this session: 'tmux', 'iterm2' or None."""
+    if tmux_target(proc_tty):
+        return "tmux"
+    return "iterm2" if _full_tty(proc_tty) else None
+
+
+def jump_to_tty(proc_tty):
+    """Focus the session's pane or tab. True only on a confirmed focus."""
+    target = tmux_target(proc_tty)
+    if not target:
+        return _iterm_jump(proc_tty)
+    sock, pane, session = target
+    window = pane.rsplit(".", 1)[0]
+    if _tmux(sock, "select-window", "-t", window) is None:
+        return False
+    _tmux(sock, "select-pane", "-t", pane)
+    own = os.environ.get("TMUX", "").split(",")[0]
+    if own and os.path.realpath(own) == os.path.realpath(sock):
+        # The deck itself runs on this server, so it can switch the client over.
+        r = _tmux(sock, "switch-client", "-t", pane)
+        return r is not None and r.returncode == 0
+    # Otherwise bring the terminal showing that tmux client to the front, if there is one.
+    clients = _tmux(sock, "list-clients", "-t", session, "-F", "#{client_tty}")
+    if clients and clients.returncode == 0:
+        for client_tty in clients.stdout.split():
+            if _iterm_jump(client_tty):
+                return True
+    return True  # the pane is selected; the session may simply have no client attached
+
+
+def get_session_screen(proc_tty):
+    """Live screen text of the session, or None."""
+    target = tmux_target(proc_tty)
+    if not target:
+        return _iterm_screen(proc_tty)
+    sock, pane, _ = target
+    r = _tmux(sock, "capture-pane", "-p", "-t", pane)
+    if r is not None and r.returncode == 0 and r.stdout.strip():
+        return r.stdout
+    return None
+
+
+def send_text_to_tty(proc_tty, text):
+    """Type `text` into the session and submit it."""
+    target = tmux_target(proc_tty)
+    if not target:
+        return _iterm_send(proc_tty, text)
+    sock, pane, _ = target
+    if _tmux(sock, "send-keys", "-t", pane, "-l", text) is None:
+        return False
+    time.sleep(0.3)  # Claude's input box needs a moment before the newline lands
+    r = _tmux(sock, "send-keys", "-t", pane, "Enter")
+    return r is not None and r.returncode == 0
 
 
 # Permission posture for hosted sessions. acceptEdits = auto-accept file edits,
@@ -1708,7 +1846,7 @@ class ClaudeMonitor(App):
             return
         if item.live and item.tty:
             if not jump_to_tty(item.tty):
-                self.notify("Session not found in iTerm2 (ended or other terminal)",
+                self.notify("Session not found in tmux or iTerm2 (it may have ended)",
                             severity="warning", timeout=3)
         else:
             self.notify("Session ended — nothing to jump to",
@@ -1762,7 +1900,7 @@ class ClaudeMonitor(App):
         self._render_selected()
 
     def action_jump_current(self) -> None:
-        # `j` jumps to the real iTerm2 tab instead of opening the embedded view.
+        # `j` jumps to the real tmux pane or iTerm2 tab instead of the embedded view.
         item = self._highlighted_row()
         if item:
             self._jump_row(item)
@@ -2066,7 +2204,7 @@ class ClaudeMonitor(App):
             self.focus_view = "mirror"      # show the result land in the terminal
             self.set_timer(0.5, self._render_focus)
         else:
-            self.notify("Could not send to the iTerm2 session",
+            self.notify("Could not send to the session",
                         severity="warning", timeout=3)
 
     def _md(self, text):
@@ -2187,7 +2325,7 @@ class ClaudeMonitor(App):
             if live and proc.get("tty"):
                 screen = get_session_screen(proc["tty"])
                 if screen is None:
-                    content.update("[yellow]Could not read the screen from iTerm2.[/]\n"
+                    content.update("[yellow]Could not read the session screen.[/]\n"
                                    "Press [b]m[/] for the transcript instead.")
                 else:
                     self._update_chat(Text(screen.rstrip("\n")),
