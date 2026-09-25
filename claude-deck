@@ -37,7 +37,7 @@ try:
     from rich.style import Style
     from rich.markup import escape as rich_escape
 except ImportError:
-    print("Missing dependencies. Install with:\n  pip3 install textual rich")
+    print("Missing dependencies. Install with:\n  ./install.sh  (from the claude-deck folder; it sets up a private virtualenv)")
     sys.exit(1)
 
 def discover_config_dirs():

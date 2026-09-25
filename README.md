@@ -108,22 +108,11 @@ else works. Set `CLAUDE_DECK_TMUX=0` to ignore tmux and always use iTerm2.
 ```bash
 git clone https://github.com/SesisnandoLRNeto/claude-deck.git
 cd claude-deck
-
-# Install dependencies (a virtualenv is recommended)
-python3 -m pip install -r requirements.txt
-
-# Run it directly...
-./claude-deck
-
-# ...or put it on your PATH so you can run `claude-deck` from anywhere
-mkdir -p ~/.local/bin
-ln -s "$(pwd)/claude-deck" ~/.local/bin/claude-deck
-# make sure ~/.local/bin is on your PATH (add to ~/.zshrc or ~/.bashrc if needed):
-#   export PATH="$HOME/.local/bin:$PATH"
+./install.sh
+claude-deck
 ```
 
-If `textual` or `rich` are missing, the program tells you the exact `pip`
-command to run.
+`install.sh` gives the deck its own virtualenv (`~/.local/share/claude-deck/venv`) and puts a small `claude-deck` launcher in `~/.local/bin` that always uses it. Homebrew's Python and most Linux distributions refuse `pip install` into the system interpreter (PEP 668), and a deck that depends on whichever `python3` is first on your PATH breaks the day that changes; the launcher avoids both. Run it again any time to update the dependencies.
 
 ### macOS automation permission
 
