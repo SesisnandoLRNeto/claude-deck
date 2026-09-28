@@ -35,10 +35,17 @@ try:
     from textual.message import Message
     from rich.text import Text
     from rich.style import Style
-    from rich.markup import escape as rich_escape
+    from rich.markup import escape as _rich_escape
 except ImportError:
     print("Missing dependencies. Install with:\n  ./install.sh  (from the claude-deck folder; it sets up a private virtualenv)")
     sys.exit(1)
+
+
+def rich_escape(text):
+    """Outside text (prompts, commands, summaries) put into markup. rich's escape leaves a lone
+    "[" alone (say "[Image: ..." cut to length), and Textual then reads it as a tag that never
+    closes and the whole render crashes. Escaping every bracket is always safe."""
+    return str(text).replace("[", "\\[")
 
 def discover_config_dirs():
     """Return [{name, color, path}] for each Claude account on disk."""
@@ -2374,7 +2381,7 @@ class ClaudeMonitor(App):
 
         has_kids = bool(s["subagents"])
         trunk = "│" if has_kids else " "
-        lines.append(f"  {trunk}   [dim]{summary}[/]")
+        lines.append(f"  {trunk}   [dim]{rich_escape(summary)}[/]")
         lines.append(f"  {trunk}   [dim]PID {pid} · {model}[/]")
 
         mcps = proc.get("mcp_servers", [])
@@ -2408,7 +2415,7 @@ class ClaudeMonitor(App):
                 )
                 if task_short:
                     lines.append(
-                        f"  {connector}      [dim]{task_short}[/]"
+                        f"  {connector}      [dim]{rich_escape(task_short)}[/]"
                     )
 
                 # Nested tool usage
@@ -2445,8 +2452,8 @@ class ClaudeMonitor(App):
 
             for task in s["tasks"]:
                 status = task["status"]
-                subject = task["subject"][:42]
-                active = task.get("active_form", "")
+                subject = rich_escape(task["subject"][:42])
+                active = rich_escape(task.get("active_form", ""))
                 blocked_by = task.get("blocked_by", [])
 
                 if status == "completed":
@@ -2488,7 +2495,7 @@ class ClaudeMonitor(App):
             is_active = cpu_f > 1
 
             for i, step in enumerate(steps):
-                text = step["text"][:45]
+                text = rich_escape(step["text"][:45])   # user text may hold [brackets]
                 is_last_step = (i == len(steps) - 1)
 
                 if is_last_step and is_active:
@@ -2504,7 +2511,7 @@ class ClaudeMonitor(App):
             # ── No tasks, no steps — show session summary ────────────
             summary = s["summary"] or s["first_prompt"]
             if summary:
-                lines.append(f"  [green]\\[✓][/] {summary[:45]}")
+                lines.append(f"  [green]\\[✓][/] {rich_escape(summary[:45])}")
             else:
                 lines.append("  [dim]No activity yet[/]")
 
@@ -2604,7 +2611,7 @@ class ClaudeMonitor(App):
                 tool_str = f"[{tc}]Tool:{tool:<10}[/]"
 
                 lines.append(
-                    f"  {sphere} [dim]{time_str}[/]  {agent_str}  {tool_str} {detail}"
+                    f"  {sphere} [dim]{time_str}[/]  {agent_str}  {tool_str} {rich_escape(detail)}"
                 )
 
         widget.update("\n".join(lines))
